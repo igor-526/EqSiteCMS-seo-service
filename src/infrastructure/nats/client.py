@@ -6,7 +6,7 @@ import nats.errors
 from infrastructure.nats.lifecycle import NatsConnectionErrorPolicy
 from nats import NATS
 from nats.js import JetStreamContext
-from nats.js.api import PubAck
+from nats.js.api import PubAck, RetentionPolicy, StorageType, StreamConfig
 from settings import NatsSettings
 
 logger = logging.getLogger(__name__)
@@ -57,6 +57,7 @@ class NatsJetstreamClient:
             closed_cb=self._error_policy.on_closed,
         )
         self._jetstream = self._connection.jetstream()
+        await self.setup_streams()
         logger.info("NATS JetStream client connected to %s", self._settings.nats_servers)
 
     async def close(self) -> None:
@@ -76,6 +77,27 @@ class NatsJetstreamClient:
             self._connection = None
             self._jetstream = None
             logger.info("NATS JetStream client closed")
+
+    async def setup_streams(self) -> None:
+        """
+        Создаёт и актуализирует JetStream streams,
+        которыми владеет seo-service.
+        """
+        if not self.is_connected:
+            raise RuntimeError("NATS client must be connected before setup")
+
+        jetstream = self._get_jetstream()
+
+        # Stream для задач парсерам
+        config = StreamConfig(
+            name=self._settings.nats_stream_seo_tasks,
+            subjects=["seo.tasks.*"],
+            storage=StorageType.FILE,
+            retention=RetentionPolicy.WORK_QUEUE,
+        )
+
+        await jetstream.add_stream(config=config)
+        logger.info("NATS stream %s created/updated", self._settings.nats_stream_seo_tasks)
 
     async def publish(
         self,

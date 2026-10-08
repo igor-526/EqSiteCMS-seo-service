@@ -30,16 +30,16 @@ logger = logging.getLogger(__name__)
 def schedule_parsing(self) -> dict:
     """
     Периодическая задача для проверки расписания парсингов.
-    
+
     Читает активные ParsingSchedule из БД, проверяет cron_expression
     и ставит задачи парсерам в NATS JetStream.
-    
+
     Returns:
         dict: Статистика выполнения задачи
     """
     task_id = self.request.id
     start_time = datetime.utcnow()
-    
+
     logger.info(
         "Starting schedule_parsing task",
         extra={
@@ -48,13 +48,13 @@ def schedule_parsing(self) -> dict:
             "timestamp": start_time.isoformat(),
         },
     )
-    
+
     # Запускаем async функцию в sync контексте Celery
     result = asyncio.run(_schedule_parsing_async(task_id))
-    
+
     end_time = datetime.utcnow()
     duration = (end_time - start_time).total_seconds()
-    
+
     logger.info(
         "Completed schedule_parsing task",
         extra={
@@ -67,17 +67,17 @@ def schedule_parsing(self) -> dict:
             "timestamp": end_time.isoformat(),
         },
     )
-    
+
     return result
 
 
 async def _schedule_parsing_async(task_id: str) -> dict:
     """
     Async implementation of schedule_parsing.
-    
+
     Args:
         task_id: Celery task ID для логирования
-        
+
     Returns:
         dict: Статистика выполнения {schedules_checked, tasks_published, errors}
     """
@@ -85,22 +85,22 @@ async def _schedule_parsing_async(task_id: str) -> dict:
     tasks_published = 0
     errors = 0
     current_time = datetime.utcnow()
-    
+
     # Получаем TaskPublisher
     task_publisher: TaskPublisher = get_task_publisher()
-    
+
     try:
         # Создаём async сессию БД
         async with SessionFactory() as session:
             session: AsyncSession
-            
+
             # Читаем активные расписания
             stmt = select(ParsingSchedule).where(ParsingSchedule.is_active)
             result = await session.execute(stmt)
             schedules = result.scalars().all()
-            
+
             schedules_checked = len(schedules)
-            
+
             logger.info(
                 "Found active parsing schedules",
                 extra={
@@ -110,7 +110,7 @@ async def _schedule_parsing_async(task_id: str) -> dict:
                     "timestamp": current_time.isoformat(),
                 },
             )
-            
+
             # Проверяем каждое расписание
             for schedule in schedules:
                 try:
@@ -118,13 +118,13 @@ async def _schedule_parsing_async(task_id: str) -> dict:
                     cron_expr = str(schedule.cron_expression)
                     parser_type_val = str(schedule.parser_type)
                     site_id_val = schedule.site_id if isinstance(schedule.site_id, int) else 0
-                    
+
                     # Проверяем, пора ли запускать задачу по cron
                     if _should_run_now(cron_expr, current_time):
                         # Генерируем уникальный task_id
                         parsing_task_id = str(uuid.uuid4())
                         trace_id = str(uuid.uuid4())
-                        
+
                         # Публикуем задачу в NATS
                         await task_publisher.publish_task(
                             parser_type=parser_type_val,
@@ -133,9 +133,9 @@ async def _schedule_parsing_async(task_id: str) -> dict:
                             params={},  # Пока пустые параметры
                             trace_id=trace_id,
                         )
-                        
+
                         tasks_published += 1
-                        
+
                         logger.info(
                             "Published parsing task",
                             extra={
@@ -149,7 +149,7 @@ async def _schedule_parsing_async(task_id: str) -> dict:
                                 "timestamp": current_time.isoformat(),
                             },
                         )
-                    
+
                 except Exception as error:
                     errors += 1
                     logger.error(
@@ -167,7 +167,7 @@ async def _schedule_parsing_async(task_id: str) -> dict:
                     )
                     # Продолжаем обработку остальных расписаний
                     continue
-    
+
     except Exception as error:
         logger.error(
             "Critical error in schedule_parsing",
@@ -181,7 +181,7 @@ async def _schedule_parsing_async(task_id: str) -> dict:
         )
         # Пробрасываем исключение для retry
         raise
-    
+
     return {
         "schedules_checked": schedules_checked,
         "tasks_published": tasks_published,
@@ -192,31 +192,31 @@ async def _schedule_parsing_async(task_id: str) -> dict:
 def _should_run_now(cron_expression: str, current_time: datetime) -> bool:
     """
     Проверяет, должна ли задача запуститься сейчас согласно cron выражению.
-    
+
     Используем простую логику: если текущее время попадает в интервал
     последних 5 минут от cron schedule, то запускаем.
-    
+
     Args:
         cron_expression: Cron выражение (например, "0 */6 * * *")
         current_time: Текущее время для проверки
-        
+
     Returns:
         bool: True если пора запускать задачу
     """
     try:
         # Создаём croniter с текущим временем
         cron = croniter(cron_expression, current_time)
-        
+
         # Получаем предыдущее запланированное время
         prev_time = cron.get_prev(datetime)
-        
+
         # Если разница между текущим временем и предыдущим запланированным
         # меньше 5 минут (интервал проверки), то пора запускать
         time_diff = (current_time - prev_time).total_seconds()
-        
+
         # 5 минут = 300 секунд (совпадает с интервалом Celery Beat)
         return 0 <= time_diff <= 300
-        
+
     except Exception as error:
         logger.warning(
             "Invalid cron expression",

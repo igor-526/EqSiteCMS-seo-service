@@ -14,12 +14,12 @@ from settings import NatsSettings
 def mock_nats_client() -> NatsJetstreamClient:
     """Create a mock NATS client."""
     mock_client = MagicMock(spec=NatsJetstreamClient)
-    
+
     # Mock publish method
     mock_ack = MagicMock()
     mock_ack.duplicate = False
     mock_client.publish = AsyncMock(return_value=mock_ack)
-    
+
     return mock_client
 
 
@@ -48,10 +48,10 @@ async def test_publish_task_correct_subject(
         params={"test": "value"},
         trace_id="trace-123",
     )
-    
+
     # Verify publish was called
     mock_nats_client.publish.assert_called_once()
-    
+
     # Check subject
     call_kwargs = mock_nats_client.publish.call_args.kwargs
     assert call_kwargs["subject"] == "seo.tasks.yandex_metrics"
@@ -70,15 +70,15 @@ async def test_publish_task_correct_payload(
         params={"test": "value", "nested": {"key": "value"}},
         trace_id="trace-123",
     )
-    
+
     # Verify publish was called
     mock_nats_client.publish.assert_called_once()
-    
+
     # Check payload
     call_kwargs = mock_nats_client.publish.call_args.kwargs
     payload_bytes = call_kwargs["payload"]
     payload = json.loads(payload_bytes.decode("utf-8"))
-    
+
     assert payload == {
         "task_id": "test-task-123",
         "site_id": 42,
@@ -99,14 +99,14 @@ async def test_publish_task_correct_headers(
         params={"test": "value"},
         trace_id="trace-123",
     )
-    
+
     # Verify publish was called
     mock_nats_client.publish.assert_called_once()
-    
+
     # Check headers
     call_kwargs = mock_nats_client.publish.call_args.kwargs
     headers = call_kwargs["headers"]
-    
+
     assert headers["trace_id"] == "trace-123"
     assert headers["Nats-Msg-Id"] == "test-task-123"
 
@@ -124,14 +124,14 @@ async def test_publish_task_auto_generates_trace_id(
         params={"test": "value"},
         # trace_id не передан
     )
-    
+
     # Verify publish was called
     mock_nats_client.publish.assert_called_once()
-    
+
     # Check headers have trace_id
     call_kwargs = mock_nats_client.publish.call_args.kwargs
     headers = call_kwargs["headers"]
-    
+
     assert "trace_id" in headers
     assert len(headers["trace_id"]) > 0  # UUID should be generated
 
@@ -149,7 +149,7 @@ async def test_publish_task_returns_task_id_and_duplicate_false(
         params={"test": "value"},
         trace_id="trace-123",
     )
-    
+
     assert message_id == "test-task-123"
     assert duplicate is False
 
@@ -164,7 +164,7 @@ async def test_publish_task_detects_duplicate(
     mock_ack = MagicMock()
     mock_ack.duplicate = True
     mock_nats_client.publish.return_value = mock_ack
-    
+
     message_id, duplicate = await task_publisher.publish_task(
         parser_type="yandex_metrics",
         task_id="test-task-123",
@@ -172,7 +172,7 @@ async def test_publish_task_detects_duplicate(
         params={"test": "value"},
         trace_id="trace-123",
     )
-    
+
     assert message_id == "test-task-123"
     assert duplicate is True
 
@@ -184,10 +184,10 @@ async def test_publish_task_different_parser_types(
 ) -> None:
     """Test that publish_task works with different parser types."""
     parser_types = ["yandex_metrics", "google_analytics", "custom_parser"]
-    
+
     for parser_type in parser_types:
         mock_nats_client.reset_mock()
-        
+
         await task_publisher.publish_task(
             parser_type=parser_type,
             task_id=f"test-task-{parser_type}",
@@ -195,7 +195,7 @@ async def test_publish_task_different_parser_types(
             params={},
             trace_id="trace-123",
         )
-        
+
         # Check subject
         call_kwargs = mock_nats_client.publish.call_args.kwargs
         expected_subject = f"seo.tasks.{parser_type}"
@@ -210,7 +210,7 @@ async def test_publish_task_propagates_exception(
     """Test that publish_task propagates exceptions from NATS client."""
     # Setup mock to raise exception
     mock_nats_client.publish.side_effect = Exception("NATS connection error")
-    
+
     with pytest.raises(Exception, match="NATS connection error"):
         await task_publisher.publish_task(
             parser_type="yandex_metrics",

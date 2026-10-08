@@ -53,8 +53,8 @@ class Settings(BaseSettings):
     postgres_db: str = Field(default="app", alias="POSTGRES_DB")
 
     # Celery / Redis settings
-    celery_broker_url: str = Field(default="redis://redis:6379/0", alias="CELERY_BROKER_URL")
-    celery_result_backend: str = Field(default="redis://redis:6379/0", alias="CELERY_RESULT_BACKEND")
+    celery_broker_url: str = Field(default="redis://redis:6379/5", alias="CELERY_BROKER_URL")
+    celery_result_backend: str = Field(default="redis://redis:6379/6", alias="CELERY_RESULT_BACKEND")
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8", extra="ignore")
 

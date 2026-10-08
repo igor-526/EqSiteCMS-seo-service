@@ -55,7 +55,7 @@ app = FastAPI(title=settings.app_title, debug=settings.debug, lifespan=lifespan)
 async def health() -> dict[str, str]:
     """
     Health check endpoint (Public Read - no auth required).
-    
+
     Returns:
         dict: Service status
     """

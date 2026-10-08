@@ -12,7 +12,7 @@ Base = declarative_base(metadata=metadata)
 
 class ParsingSchedule(Base):
     """Model for storing parsing schedules.
-    
+
     Attributes:
         id: Unique identifier for the schedule
         site_id: ID of the site to parse
@@ -33,9 +33,7 @@ class ParsingSchedule(Base):
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
     updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
 
-    __table_args__ = (
-        UniqueConstraint("site_id", "parser_type", name="uq_site_parser"),
-    )
+    __table_args__ = (UniqueConstraint("site_id", "parser_type", name="uq_site_parser"),)
 
     def __repr__(self) -> str:
         return (
