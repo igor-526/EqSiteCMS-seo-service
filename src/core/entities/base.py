@@ -11,3 +11,10 @@ class Entity(BaseModel):
 class TimestampMixin(BaseModel):
     created_at: datetime = Field(default_factory=lambda: datetime.now(UTC))
     updated_at: datetime | None = None
+
+
+class PaginatedEntities[T](BaseModel):
+    """Пагинированный список сущностей или DTO."""
+
+    items: list[T] = Field(default_factory=list, description="Список элементов")
+    total: int = Field(default=0, description="Общее количество элементов")

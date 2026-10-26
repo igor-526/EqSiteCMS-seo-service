@@ -1,12 +1,13 @@
 [project]
-name = "fastapi-template"
+name = "seo-service"
 version = "0.1.0"
-description = "FastAPI template with Clean Architecture and PostgreSQL"
+description = "SEO queries and pages service for Equestrian Site CMS"
 readme = "README.md"
 requires-python = ">=3.14,<3.15"
 dependencies = [
     "alembic>=1.16",
     "asyncpg>=0.30",
+    "dependency-injector>=4.49.1",
     "fastapi>=0.116",
     "pydantic-settings>=2.10",
     "sentry-sdk[fastapi,sqlalchemy]>=2.47",
@@ -18,6 +19,7 @@ dependencies = [
 dev = [
     "basedpyright>=1.32",
     "flake8>=7.3",
+    "httpx>=0.28.1",
     "httpx2>=0.1",
     "mypy>=2.2",
     "pytest>=8.4",
@@ -43,7 +45,7 @@ extend-exclude = [".github", ".helm"]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["api", "core", "depends", "models", "repositories", "settings", "utils"]
+known-first-party = ["api", "containers", "core", "depends", "models", "repositories", "settings", "utils"]
 
 [tool.ruff.format]
 quote-style = "double"

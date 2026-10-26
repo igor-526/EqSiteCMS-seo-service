@@ -1,7 +1,10 @@
+import pytest
 from fastapi.testclient import TestClient
 
 from main import app
 from settings import Settings
+
+from .conftest import RuntimeApi
 
 
 def test_health() -> None:
@@ -24,3 +27,15 @@ def test_template_runtime_has_no_cors_configuration_or_headers() -> None:
 
     assert "access-control-allow-origin" not in response.headers
     assert "access-control-allow-credentials" not in response.headers
+
+
+@pytest.mark.parametrize(
+    "headers", [{}, {"Authorization": "ignored", "Cookie": "ignored", "X-Equestrian-Id": "invalid"}]
+)
+async def test_public_health_without_database(runtime_api: RuntimeApi, headers: dict):
+    async with runtime_api.client() as client:
+        response = await client.get("/health", headers=headers)
+    assert response.status_code == 200
+    assert response.json() == {"status": "ok"}
+    assert runtime_api.events == []
+    runtime_api.assert_no_calls()
