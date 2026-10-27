@@ -58,7 +58,7 @@ Host-порт `EXPOSE_SEO_SERVICE_PORT` предназначен только д
 | GET | `/health` | Public Read | любой | `200` | то же |
 | POST | `/api/search-queries/resolve` | ITN Write (исключение) | парсеры | `200`; tenant `401`; body `400` | то же |
 | POST | `/api/pages/resolve` | ITN Write (исключение) | парсеры | `200`; tenant `401`; body `400` | то же |
-| GET | `/api/search-queries` | ITN Read (исключение) | backend | `200`; tenant `401`; query `400` | то же |
+| GET | `/api/search-queries` | ITN Read (исключение) | backend | `200` с `metrics_table`; tenant `401` до БД/peer; query `400` до peer; сбой peer `502` | то же |
 | GET | `/api/pages` | ITN Read (исключение) | backend | `200` с `metrics_table`; tenant `401` до БД/peer; query `400` до peer; сбой peer `502` | то же |
 | GET | `/api/page-normalization/blacklisted-query-params` | ITN Read (исключение) | backend | `200`; tenant `401` | то же |
 | POST | `/api/page-normalization/blacklisted-query-params` | ITN Write (исключение) | backend | `201`; `400`; `409`; tenant `401` | то же |
@@ -83,10 +83,10 @@ Health статический `{"status":"ok"}`, без обращения к Б
   строки. `200 {"items":[{"source":"...","normalized":"...","id":"UUID"}]}`
   сохраняет порядок и дубли входа; одинаковые нормализованные значения получают один UUID
   в конюшне. Ошибка любого элемента отклоняет весь batch (`400`).
-- Список запросов: `{items: [...], total: int}`; элементы запросов — `id/query/created_at`,
+- Список запросов: `{items: [...], total: int, metrics_table: {...}}`; элементы запросов — `id/query/created_at`,
   страниц (см. ниже) — `id/page/created_at`. Внутренние hash и equestrian_id не выдаются.
   `search` — trim и регистронезависимое вхождение, `%`, `_`, `\` буквальны;
-  `ordering=query|-query`, по умолчанию `created_at DESC, id DESC`.
+  `ordering=query|-query|created_at|-created_at|metric:YYYY-MM-DD|-metric:YYYY-MM-DD`, по умолчанию `created_at DESC, id DESC`.
   `limit=20` приводится к 1..100, `offset=0` — к ≥0; нечисловые значения и неизвестная
   сортировка → `400`. `total` учитывает поиск, но не пагинацию.
 - Черные списки: body `{"value":"..."}`, список без пагинации по `value ASC`.
@@ -139,7 +139,38 @@ M4 получает фактические границы колонки и на
 `/api/metrica/page-stats/ranking`. Передаётся tenant UUID без credentials.
 Любой не-200 (включая 400), timeout, транспортная ошибка или неверная схема
 peer → `502 {"detail":"Сервис статистики недоступен"}`, транзакция откатывается;
-тело/URL peer не возвращаются. «Запросы» от ya-metrica не зависят.
+тело/URL peer не возвращаются.
+
+### Запросы с метриками: `GET /api/search-queries`
+
+Ответ: `{"items":[{"id":"UUID","query":"Лошадь","created_at":"..."}],
+"total":1,"metrics_table":{...}}`. Таблица обязательна, `version=1`, `row_key="id"`;
+значения содержат только UUID текущей страницы. Используются **те же** resolver,
+registry, builder и форматтеры, что у страниц: восемь metrics, четыре режима,
+периоды/defaults/limits и разреженные ячейки из раздела выше. Пропуск — `—`, не ноль.
+
+Параметры: `search`, `ordering=query|-query|created_at|-created_at|±metric:YYYY-MM-DD`,
+`mode=day`, `metric=visits`, парные `date_from/date_to`, `limit=20`, `offset=0`.
+В отличие от страниц числовые limit/offset сохраняют clamp 1..100 / ≥0.
+Нечисловые limit/offset и невалидные mode/metric/даты/ordering → `400` до данных/peer.
+Default — полный `created_at DESC, id DESC`.
+
+Поток: validation/clamp → общий период → M6 query ranking при существующей колонке
+→ SQL list/count с tenant/search/rank до pagination → M5 batch table с UUID текущей
+страницы и всеми buckets → адаптер query values → общий builder. M5:
+`/api/metrica/search-query-stats/table`; M6: `/api/metrica/search-query-stats/ranking`.
+Ровно два SEO SQL, ≤2 peer-вызовов; без metric ordering нет M6, без строк нет M5.
+Валидная metric-дата вне периода даёт default SQL order и `metrics_table.ordering=null`
+без M6. Нет агрегации или сортировки строк в Python, total не зависит от статистики.
+Строки без статистики идут последними в обоих направлениях, затем default order.
+
+Доступ — Internal Trusted Network Read: валидный UUID `X-Equestrian-Id` обязателен;
+missing/empty/invalid → `401` до БД/peer. Cookie/Bearer игнорируются и не заменяют
+selector. Tenant из selector используется и в SQL, и в M5/M6. Метрика non-200,
+timeout/transport/schema/metric/direction mismatch → безопасный `502`
+`Сервис статистики недоступен`, rollback, без частичного успеха или утечки URL/тела.
+Новые порты не открываются. Production isolation остаётся отдельным release gate:
+успешные тесты не подтверждают внешнюю недоступность peers и PostgreSQL.
 
 | Env seo-service | Default | Назначение |
 |---|---|---|

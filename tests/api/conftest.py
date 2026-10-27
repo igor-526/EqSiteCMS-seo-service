@@ -91,6 +91,10 @@ def runtime_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[RuntimeApi]:
     with ExitStack() as stack:
         for name, service in harness.services.items():
             stack.enter_context(getattr(services_container, name).override(providers.Object(service)))
+        from tests.api.test_listing_api import empty_metrics_table
+
+        for name in ("page_service", "search_query_service"):
+            harness.services[name].list_filtered.return_value["metrics_table"] = empty_metrics_table()
         yield harness
     assert not repositories_container.session.initialized
     for provider, enabled, disabled in provider_modes:

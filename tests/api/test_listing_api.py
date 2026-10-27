@@ -33,18 +33,17 @@ async def test_listing_contract(runtime_api: RuntimeApi, path, service_name, fie
         ],
         "total": 7,
     }
-    if path == "pages":
-        service.list_filtered.return_value["metrics_table"] = empty_metrics_table()
+    service.list_filtered.return_value["metrics_table"] = empty_metrics_table()
     params = (
         {} if ordering is None else {"ordering": ordering + field, "search": "ЛОШАДЬ", "limit": "5", "offset": "2"}
     )
     async with runtime_api.client() as client:
         response = await client.get(f"/api/{path}", headers={"X-Equestrian-Id": str(TENANT_ID)}, params=params)
     assert response.status_code == 200, response.text
-    assert set(response.json()) == ({"items", "total", "metrics_table"} if path == "pages" else {"items", "total"})
+    assert set(response.json()) == {"items", "total", "metrics_table"}
     assert response.json()["total"] == 7
     assert set(response.json()["items"][0]) == {"id", field, "created_at"}
-    extra = {"mode": "day", "metric": "visits", "date_from": None, "date_to": None} if path == "pages" else {}
+    extra = {"mode": "day", "metric": "visits", "date_from": None, "date_to": None}
     service.list_filtered.assert_awaited_once_with(
         equestrian_id=TENANT_ID,
         search=None if ordering is None else "ЛОШАДЬ",
@@ -59,17 +58,22 @@ async def test_listing_contract(runtime_api: RuntimeApi, path, service_name, fie
 @pytest.mark.parametrize(
     "params",
     [
-        {"ordering": "created_at"},
         {"offset": "abc"},
         {"limit": "abc"},
         {"ordering": "id"},
     ],
 )
-async def test_queries_invalid_parameters_unchanged(runtime_api, params):
-    async with runtime_api.client() as client:
-        response = await client.get("/api/search-queries", headers={"X-Equestrian-Id": str(TENANT_ID)}, params=params)
+async def test_queries_invalid_structural_parameters(runtime_api, params):
+    from tests.unit.test_search_query_service import make_listing_service as make_query_service
+
+    service, repository, peer = make_query_service()
+    with services_container.search_query_service.override(providers.Object(service)):
+        async with runtime_api.client() as client:
+            response = await client.get(
+                "/api/search-queries", headers={"X-Equestrian-Id": str(TENANT_ID)}, params=params
+            )
     assert response.status_code == 400
-    runtime_api.assert_no_calls()
+    assert repository.mock_calls == [] and peer.mock_calls == []
 
 
 @pytest.mark.parametrize(

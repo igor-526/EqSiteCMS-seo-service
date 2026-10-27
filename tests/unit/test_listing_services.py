@@ -4,8 +4,9 @@ from uuid import uuid4
 import pytest
 
 from core.entities import Page, SearchQuery
-from core.services import PageService, SearchQueryNormalizer, SearchQueryService
+from core.services import PageService, SearchQueryService
 from tests.unit.test_page_service import make_listing_service
+from tests.unit.test_search_query_service import make_listing_service as make_query_listing_service
 
 
 @pytest.mark.parametrize("kind", ["query", "page"])
@@ -34,7 +35,7 @@ async def test_listing_clamps_pagination_trims_search_and_keeps_total(
     repository = AsyncMock()
     service: SearchQueryService | PageService
     if kind == "query":
-        service = SearchQueryService(repository, SearchQueryNormalizer())
+        service = make_query_listing_service(repository)[0]
         repository.get_filtered.return_value = [SearchQuery(equestrian_id=tenant, query="Лошадь")]
     else:
         service = make_listing_service(repository)[0]
@@ -43,7 +44,7 @@ async def test_listing_clamps_pagination_trims_search_and_keeps_total(
     result = await service.list_filtered(equestrian_id=tenant, search=search, limit=limit, offset=offset)
     assert result.total == 42 and len(result.items) == 1
     assert set(result.items[0].model_dump()) == {"id", kind, "created_at"}
-    extra = {"ranked_page_ids": None} if kind == "page" else {}
+    extra = {"ranked_page_ids": None} if kind == "page" else {"ranked_search_query_ids": None}
     repository.get_filtered.assert_awaited_once_with(
         equestrian_id=tenant,
         search=expected_search,
@@ -62,7 +63,7 @@ async def test_listing_passes_typed_ordering_and_empty_result(descending: bool) 
     for repository in (queries, pages):
         repository.get_filtered.return_value = []
         repository.count_filtered.return_value = 0
-    query_result = await SearchQueryService(queries, SearchQueryNormalizer()).list_filtered(
+    query_result = await make_query_listing_service(queries)[0].list_filtered(
         equestrian_id=tenant, ordering="-query" if descending else "query"
     )
     page_result = await make_listing_service(pages)[0].list_filtered(

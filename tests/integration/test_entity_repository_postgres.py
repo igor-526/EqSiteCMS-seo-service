@@ -157,9 +157,6 @@ async def test_pages_created_at_order(pg_session: AsyncSession, descending: bool
         expected.reverse()
     rows = await repository.get_filtered(equestrian_id=tenant, ordering="-created_at" if descending else "created_at")
     assert [row.id for row in rows] == expected
-    for ordering in ["created_at", "-created_at"]:
-        with pytest.raises(ClientError):
-            await SearchQueryRepository(pg_session).get_filtered(equestrian_id=tenant, ordering=ordering)
 
 
 @pytest.mark.parametrize("reverse_rank", [False, True])

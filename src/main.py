@@ -43,6 +43,11 @@ services_container.page_service.add_kwargs(
     metrics_period_resolver=services_container.metrics_period_resolver,
     metrics_table_builder=services_container.metrics_table_builder,
 )
+services_container.search_query_service.add_kwargs(
+    ya_metrica_client=clients_container.ya_metrica_client,
+    metrics_period_resolver=services_container.metrics_period_resolver,
+    metrics_table_builder=services_container.metrics_table_builder,
+)
 services_container.wire(modules=[search_queries, pages, blacklisted_query_params, blacklisted_hashes])
 
 

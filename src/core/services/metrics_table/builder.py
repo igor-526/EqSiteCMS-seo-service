@@ -5,6 +5,7 @@ from core.schemas.api.metrics_table import MetricCellOutDto, MetricColumnOutDto,
 from core.schemas.clients.ya_metrica import PageStatsTable
 from core.services.metrics_period import ResolvedMetricsPeriod
 from core.services.metrics_table.header_formatter import PeriodHeaderFormatter
+from core.services.metrics_table.input import MetricsValues
 from core.services.metrics_table.registry import MetricRegistry
 from core.services.metrics_table.value_formatter import MetricValueFormatter
 
@@ -30,10 +31,27 @@ class MetricsTableBuilder:
         stats: PageStatsTable | None = None,
         ordering: str | None = None,
     ) -> MetricsTableOutDto:
+        return self.build_rows(
+            period=period,
+            metric=metric,
+            row_ids=page_ids,
+            stats=MetricsValues.from_pages(stats) if stats is not None else None,
+            ordering=ordering,
+        )
+
+    def build_rows(
+        self,
+        *,
+        period: ResolvedMetricsPeriod,
+        metric: str,
+        row_ids: Sequence[UUID],
+        stats: MetricsValues | None = None,
+        ordering: str | None = None,
+    ) -> MetricsTableOutDto:
         metadata = self._registry.get(metric)
         if stats is not None and stats.metric != metric:
             raise ValueError("Metric mismatch")
-        row_ids = set(page_ids)
+        allowed_row_ids = set(row_ids)
         columns: list[MetricColumnOutDto] = []
         by_bucket: dict[str, dict[str, MetricCellOutDto]] = {}
         for column in period.columns:
@@ -53,8 +71,8 @@ class MetricsTableBuilder:
         if stats is not None:
             for item in stats.values:
                 bucket_values = by_bucket.get(item.bucket.isoformat())
-                if bucket_values is not None and item.page_id in row_ids:
-                    bucket_values[str(item.page_id)] = MetricCellOutDto(
+                if bucket_values is not None and item.row_id in allowed_row_ids:
+                    bucket_values[str(item.row_id)] = MetricCellOutDto(
                         text=self._value_formatter.format(item.value, metadata.value_type),
                         value=item.value,
                     )

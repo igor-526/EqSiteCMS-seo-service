@@ -13,9 +13,10 @@ class SearchQueryRepositoryProtocol(Protocol):
         *,
         equestrian_id: UUID,
         search: str | None = None,
-        ordering: Literal["query", "-query"] | None = None,
+        ordering: Literal["query", "-query", "created_at", "-created_at"] | None = None,
         limit: int = 20,
         offset: int = 0,
+        ranked_search_query_ids: Sequence[UUID] | None = None,
     ) -> list[SearchQuery]: ...
 
     async def count_filtered(self, *, equestrian_id: UUID, search: str | None = None) -> int: ...

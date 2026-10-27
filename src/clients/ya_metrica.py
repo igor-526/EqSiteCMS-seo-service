@@ -9,7 +9,13 @@ import httpx
 from pydantic import BaseModel
 
 from core.exceptions import MetricaUnavailableError
-from core.schemas.clients.ya_metrica import PageStatsRanking, PageStatsTable, RankingDirection
+from core.schemas.clients.ya_metrica import (
+    PageStatsRanking,
+    PageStatsTable,
+    RankingDirection,
+    SearchQueryStatsRanking,
+    SearchQueryStatsTable,
+)
 from core.services.metrics_period import PeriodColumn
 
 ResponseDto = TypeVar("ResponseDto", bound=BaseModel)
@@ -81,6 +87,37 @@ class YaMetricaClient:
                 ("direction", direction),
             ],
             PageStatsRanking,
+        )
+        if result.metric != metric or result.direction != direction:
+            raise MetricaUnavailableError()
+        return result
+
+    async def query_table(
+        self, *, equestrian_id: UUID, metric: str, columns: Sequence[PeriodColumn], search_query_ids: Sequence[UUID]
+    ) -> SearchQueryStatsTable:
+        params = [("equestrian_id", str(equestrian_id)), ("metric", metric)]
+        params.extend(
+            ("bucket", f"{column.date_from.isoformat()}..{column.date_to.isoformat()}") for column in columns
+        )
+        params.extend(("search_query_ids", str(search_query_id)) for search_query_id in search_query_ids)
+        result = await self._get("/api/metrica/search-query-stats/table", params, SearchQueryStatsTable)
+        if result.metric != metric:
+            raise MetricaUnavailableError()
+        return result
+
+    async def query_ranking(
+        self, *, equestrian_id: UUID, metric: str, date_from: date, date_to: date, direction: RankingDirection
+    ) -> SearchQueryStatsRanking:
+        result = await self._get(
+            "/api/metrica/search-query-stats/ranking",
+            [
+                ("equestrian_id", str(equestrian_id)),
+                ("metric", metric),
+                ("date_from", date_from.isoformat()),
+                ("date_to", date_to.isoformat()),
+                ("direction", direction),
+            ],
+            SearchQueryStatsRanking,
         )
         if result.metric != metric or result.direction != direction:
             raise MetricaUnavailableError()

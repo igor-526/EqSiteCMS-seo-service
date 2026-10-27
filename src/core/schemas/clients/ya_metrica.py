@@ -34,3 +34,22 @@ class PageStatsRanking(BaseModel):
     metric: MetricKey
     direction: RankingDirection
     page_ids: list[UUID]
+
+
+class SearchQueryStatsValue(BaseModel):
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    search_query_id: UUID
+    bucket: date
+    value: StrictInt | StrictFloat
+
+
+class SearchQueryStatsTable(BaseModel):
+    metric: MetricKey
+    values: list[SearchQueryStatsValue]
+
+
+class SearchQueryStatsRanking(BaseModel):
+    metric: MetricKey
+    direction: RankingDirection
+    search_query_ids: list[UUID]
