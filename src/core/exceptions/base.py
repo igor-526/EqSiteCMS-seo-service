@@ -40,3 +40,8 @@ class InvalidValueError(ClientError):
 
     def at_index(self, index: int) -> ClientError:
         return ClientError(f"Некорректное значение элемента items[{index}]")
+
+
+class MetricaUnavailableError(AppError):
+    status_code = 502
+    message = "Сервис статистики недоступен"

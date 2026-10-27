@@ -710,6 +710,7 @@ dependencies = [
     { name = "asyncpg" },
     { name = "dependency-injector" },
     { name = "fastapi" },
+    { name = "httpx" },
     { name = "pydantic-settings" },
     { name = "sentry-sdk", extra = ["fastapi", "sqlalchemy"] },
     { name = "sqlalchemy" },
@@ -720,7 +721,6 @@ dependencies = [
 dev = [
     { name = "basedpyright" },
     { name = "flake8" },
-    { name = "httpx" },
     { name = "httpx2" },
     { name = "mypy" },
     { name = "pytest" },
@@ -734,6 +734,7 @@ requires-dist = [
     { name = "asyncpg", specifier = ">=0.30" },
     { name = "dependency-injector", specifier = ">=4.49.1" },
     { name = "fastapi", specifier = ">=0.116" },
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "pydantic-settings", specifier = ">=2.10" },
     { name = "sentry-sdk", extras = ["fastapi", "sqlalchemy"], specifier = ">=2.47" },
     { name = "sqlalchemy", specifier = ">=2.0" },
@@ -744,7 +745,6 @@ requires-dist = [
 dev = [
     { name = "basedpyright", specifier = ">=1.32" },
     { name = "flake8", specifier = ">=7.3" },
-    { name = "httpx", specifier = ">=0.28.1" },
     { name = "httpx2", specifier = ">=0.1" },
     { name = "mypy", specifier = ">=2.2" },
     { name = "pytest", specifier = ">=8.4" },

@@ -136,3 +136,84 @@ async def test_missing_resolved_hash_maps_safe_error(pg_session: AsyncSession, r
     monkeypatch.setattr(pg_session, "execute", execute)
     with pytest.raises(RepositoryError, match="^Внутренняя ошибка сервиса$"):
         await repository.resolve(equestrian_id=UUID(int=1), values=["sensitive-value"])
+
+
+@pytest.mark.parametrize("descending", [False, True])
+async def test_pages_created_at_order(pg_session: AsyncSession, descending: bool):
+    """IT-SP-01: full timestamps and same-direction UUID tiebreaker, pages only."""
+    repository = PageRepository(pg_session)
+    tenant = uuid4()
+    ids = await repository.resolve(equestrian_id=tenant, values=["/a", "/b", "/c", "/d"])
+    ordered_ids = sorted(ids.values())
+    now = datetime(2026, 10, 20, 12, tzinfo=UTC)
+    await pg_session.execute(update(repository.table).values(created_at=now))
+    await pg_session.execute(
+        update(repository.table)
+        .where(repository.table.c.id == ordered_ids[0])
+        .values(created_at=now + timedelta(microseconds=1))
+    )
+    expected = ordered_ids[1:] + ordered_ids[:1]
+    if descending:
+        expected.reverse()
+    rows = await repository.get_filtered(equestrian_id=tenant, ordering="-created_at" if descending else "created_at")
+    assert [row.id for row in rows] == expected
+    for ordering in ["created_at", "-created_at"]:
+        with pytest.raises(ClientError):
+            await SearchQueryRepository(pg_session).get_filtered(equestrian_id=tenant, ordering=ordering)
+
+
+@pytest.mark.parametrize("reverse_rank", [False, True])
+async def test_pages_ranked_search_pagination(pg_session: AsyncSession, reverse_rank: bool):
+    """IT-SP-02: either M4 direction; unmatched ranks never exclude unranked pages."""
+    repository = PageRepository(pg_session)
+    tenant, other = uuid4(), uuid4()
+    ids = await repository.resolve(equestrian_id=tenant, values=["/a", "/ab", "/abc", "/abcd", "/x"])
+    foreign = await repository.resolve(equestrian_id=other, values=["/a"])
+    await pg_session.execute(update(repository.table).values(created_at=datetime.now(UTC)))
+    known_ranks = [ids["/ab"], ids["/a"]]
+    if reverse_rank:
+        known_ranks.reverse()
+    ranked = [foreign["/a"], uuid4(), ids["/x"], *known_ranks]
+    expected = known_ranks + sorted([ids["/abc"], ids["/abcd"]], reverse=True)
+    rows = await repository.get_filtered(equestrian_id=tenant, search="a", ranked_page_ids=ranked)
+    assert [row.id for row in rows] == expected
+    page = await repository.get_filtered(equestrian_id=tenant, search="a", ranked_page_ids=ranked, limit=2, offset=1)
+    assert [row.id for row in page] == expected[1:3]
+    assert await repository.count_filtered(equestrian_id=tenant, search="a") == 4
+    empty_rank = await repository.get_filtered(equestrian_id=tenant, search="a", ranked_page_ids=[])
+    assert [row.id for row in empty_rank] == sorted([ids[v] for v in ids if "a" in v], reverse=True)
+
+
+@pytest.mark.parametrize("limit", [5, 50])
+@pytest.mark.parametrize("with_rank", [False, True])
+async def test_pages_two_sql_statements(pg_session: AsyncSession, sql_log: list[str], limit: int, with_rank: bool):
+    """IT-SP-03: exactly one listing SELECT and one independent total SELECT."""
+    repository = PageRepository(pg_session)
+    tenant = uuid4()
+    ids = await repository.resolve(equestrian_id=tenant, values=[f"/page-{i}" for i in range(60)])
+    ranked = list(reversed(list(ids.values()))) if with_rank else None
+    sql_log.clear()
+    rows = await repository.get_filtered(equestrian_id=tenant, limit=limit, ranked_page_ids=ranked)
+    total = await repository.count_filtered(equestrian_id=tenant)
+    assert len(rows) == limit and total == 60
+    assert len(sql_log) == 2
+    assert all(statement.lstrip().upper().startswith("SELECT") for statement in sql_log)
+    assert "count(" in sql_log[1]
+    if with_rank:
+        assert "WITH ORDINALITY" in sql_log[0] and "NULLS LAST" in sql_log[0]
+        assert "unnest(" in sql_log[0]
+
+
+async def test_pages_rank_5000_uuids(pg_session: AsyncSession, sql_log: list[str]):
+    """IT-SP-04: one SQL with one array parameter, even for a large ranking."""
+    repository = PageRepository(pg_session)
+    tenant = uuid4()
+    ids = await repository.resolve(equestrian_id=tenant, values=[f"/page-{i}" for i in range(100)])
+    expected = list(reversed(list(ids.values())))
+    ranked = [uuid4() for _ in range(4900)] + expected
+    sql_log.clear()
+    rows = await repository.get_filtered(equestrian_id=tenant, ranked_page_ids=ranked, limit=50, offset=25)
+    assert [row.id for row in rows] == expected[25:75]
+    assert len(sql_log) == 1
+    assert "WITH ORDINALITY" in sql_log[0]
+    assert "UUID[]" in sql_log[0]

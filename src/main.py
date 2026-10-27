@@ -18,7 +18,8 @@ from api import (
     search_queries_router,
 )
 from containers import services_container
-from core.exceptions import AppError
+from containers.application import clients_container
+from core.exceptions import AppError, MetricaUnavailableError
 from depends.tenant import get_equestrian_id
 from settings import settings
 from utils.configure_sentry import configure_sentry
@@ -36,6 +37,12 @@ async def lifespan(_: FastAPI):
         await close_database()
 
 
+# Composition root: shared settings and peer providers, without repository changes.
+services_container.page_service.add_kwargs(
+    ya_metrica_client=clients_container.ya_metrica_client,
+    metrics_period_resolver=services_container.metrics_period_resolver,
+    metrics_table_builder=services_container.metrics_table_builder,
+)
 services_container.wire(modules=[search_queries, pages, blacklisted_query_params, blacklisted_hashes])
 
 
@@ -83,6 +90,7 @@ async def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.exception_handler(MetricaUnavailableError)
 @app.exception_handler(AppError)
 async def app_error_handler(_: Request, exc: AppError) -> JSONResponse:
     # Instance messages may include diagnostics: only class constants are public.
@@ -102,6 +110,10 @@ async def validation_error_handler(_: Request, exc: RequestValidationError) -> J
         "item_id",
         "search",
         "ordering",
+        "mode",
+        "metric",
+        "date_from",
+        "date_to",
         "limit",
         "offset",
     }

@@ -160,6 +160,15 @@ class ResolvableRepository[E: Entity](ABC):
             )
             return rows.scalar_one()
 
+    def _get_order(self, ordering: str | None) -> list[ColumnElement]:
+        if ordering is None:
+            return [self.table.c.created_at.desc(), self.table.c.id.desc()]
+        elif ordering == self.value_column:
+            return [self.table.c[self.value_column].asc(), self.table.c.id.asc()]
+        elif ordering == f"-{self.value_column}":
+            return [self.table.c[self.value_column].desc(), self.table.c.id.asc()]
+        raise ClientError()
+
     async def get_filtered(
         self,
         *,
@@ -169,14 +178,7 @@ class ResolvableRepository[E: Entity](ABC):
         limit: int = 20,
         offset: int = 0,
     ) -> list[E]:
-        if ordering is None:
-            order = [self.table.c.created_at.desc(), self.table.c.id.desc()]
-        elif ordering == self.value_column:
-            order = [self.table.c[self.value_column].asc(), self.table.c.id.asc()]
-        elif ordering == f"-{self.value_column}":
-            order = [self.table.c[self.value_column].desc(), self.table.c.id.asc()]
-        else:
-            raise ClientError()
+        order = self._get_order(ordering)
         with repository_errors():
             rows = await self.session.execute(
                 select(self.table)

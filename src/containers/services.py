@@ -1,5 +1,6 @@
 from dependency_injector import containers, providers
 
+from containers.settings import SettingsContainer
 from core.services import (
     BlacklistedHashService,
     BlacklistedQueryParamService,
@@ -8,10 +9,29 @@ from core.services import (
     SearchQueryNormalizer,
     SearchQueryService,
 )
+from core.services.metrics_period import MetricsPeriodResolver
+from core.services.metrics_table.builder import MetricsTableBuilder
+from core.services.metrics_table.header_formatter import PeriodHeaderFormatter
+from core.services.metrics_table.registry import MetricRegistry
+from core.services.metrics_table.value_formatter import MetricValueFormatter
 
 
 class ServicesContainer(containers.DeclarativeContainer):
     repositories_container = providers.DependenciesContainer()
+    settings_container = providers.Container(SettingsContainer)
+
+    metrics_period_resolver = providers.Factory(
+        MetricsPeriodResolver, utc_offset_hours=settings_container.app_settings.provided.seo_utc_offset_hours
+    )
+    metric_registry = providers.Factory(MetricRegistry)
+    metric_value_formatter = providers.Factory(MetricValueFormatter)
+    period_header_formatter = providers.Factory(PeriodHeaderFormatter)
+    metrics_table_builder = providers.Factory(
+        MetricsTableBuilder,
+        registry=metric_registry,
+        value_formatter=metric_value_formatter,
+        header_formatter=period_header_formatter,
+    )
 
     search_query_normalizer = providers.Factory(SearchQueryNormalizer)
     page_normalizer = providers.Factory(PageNormalizer)

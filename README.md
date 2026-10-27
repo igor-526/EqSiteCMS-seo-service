@@ -59,7 +59,7 @@ Host-порт `EXPOSE_SEO_SERVICE_PORT` предназначен только д
 | POST | `/api/search-queries/resolve` | ITN Write (исключение) | парсеры | `200`; tenant `401`; body `400` | то же |
 | POST | `/api/pages/resolve` | ITN Write (исключение) | парсеры | `200`; tenant `401`; body `400` | то же |
 | GET | `/api/search-queries` | ITN Read (исключение) | backend | `200`; tenant `401`; query `400` | то же |
-| GET | `/api/pages` | ITN Read (исключение) | backend | `200`; tenant `401`; query `400` | то же |
+| GET | `/api/pages` | ITN Read (исключение) | backend | `200` с `metrics_table`; tenant `401` до БД/peer; query `400` до peer; сбой peer `502` | то же |
 | GET | `/api/page-normalization/blacklisted-query-params` | ITN Read (исключение) | backend | `200`; tenant `401` | то же |
 | POST | `/api/page-normalization/blacklisted-query-params` | ITN Write (исключение) | backend | `201`; `400`; `409`; tenant `401` | то же |
 | PATCH | `/api/page-normalization/blacklisted-query-params/{item_id}` | ITN Write (исключение) | backend | `200`; `400`; `404` чужой/нет; `409`; tenant `401` | то же |
@@ -83,16 +83,73 @@ Health статический `{"status":"ok"}`, без обращения к Б
   строки. `200 {"items":[{"source":"...","normalized":"...","id":"UUID"}]}`
   сохраняет порядок и дубли входа; одинаковые нормализованные значения получают один UUID
   в конюшне. Ошибка любого элемента отклоняет весь batch (`400`).
-- Списки: `{items: [...], total: int}`; элементы запросов — `id/query/created_at`,
-  страниц — `id/page/created_at`. Внутренние hash и equestrian_id не выдаются.
+- Список запросов: `{items: [...], total: int}`; элементы запросов — `id/query/created_at`,
+  страниц (см. ниже) — `id/page/created_at`. Внутренние hash и equestrian_id не выдаются.
   `search` — trim и регистронезависимое вхождение, `%`, `_`, `\` буквальны;
-  `ordering=query|-query` либо `page|-page`, по умолчанию `created_at DESC, id DESC`.
+  `ordering=query|-query`, по умолчанию `created_at DESC, id DESC`.
   `limit=20` приводится к 1..100, `offset=0` — к ≥0; нечисловые значения и неизвестная
   сортировка → `400`. `total` учитывает поиск, но не пагинацию.
 - Черные списки: body `{"value":"..."}`, список без пагинации по `value ASC`.
   Trim, у хеша удаляется один ведущий `#`. Значение 1..255 символов, без whitespace,
   управляющих символов и `#`; у query-параметра также запрещены `&`, `=`, `?`.
   Дубль внутри tenant и списка → `409`, malformed item_id → `400`.
+
+### Страницы с метриками: `GET /api/pages`
+
+Ответ: `{"items": [{"id": "UUID", "page": "/a", "created_at": "..."}],
+"total": 1, "metrics_table": {...}}`. `total` зависит от tenant и поиска, но не
+от пагинации или статистики. `search` — те же trim и буквальное вхождение.
+`limit` — 1..100 (default 20), `offset` ≥0 (default 0); выход за диапазон → `400`
+(список «Запросы» сохраняет прежнее приведение диапазона).
+
+| Query | Значения / по умолчанию |
+|---|---|
+| `mode` | `day` (default), `week`, `month`, `year` |
+| `metric` | `visits` (default), `users`, `pageviews`, `bounces`, `bounce_rate`, `page_depth`, `avg_visit_duration_seconds`, `visit_duration_seconds` |
+| `date_from`, `date_to` | Только вместе, `YYYY-MM-DD`, начало ≤ конца |
+| `ordering` | `page`, `-page`, `created_at`, `-created_at`, `metric:YYYY-MM-DD`, `-metric:YYYY-MM-DD`; default `created_at DESC, id DESC` |
+
+Некорректные mode/metric/даты/ordering/пагинация → `400` до БД и ya-metrica.
+«Сегодня» вычисляется в UTC со сдвигом `SEO_UTC_OFFSET_HOURS`. Без дат период
+заканчивается сегодня и начинается: day — 6 дней назад; week — в понедельник
+3 недели назад; month — 1-го числа 5 месяцев назад; year — 1 января прошлого года.
+Для week/month/year явные даты расширяются до календарных границ. Будущее начало
+заменяется сегодня до выравнивания; затем диапазон ограничивается числом единиц
+от начала (day 31, week 16, month 12, year 5), после этого конец — сегодняшним днём.
+Колонки идут по возрастанию; последняя текущая единица может быть неполной.
+
+`metrics_table` — универсальный DTO: `version=1`, `row_key="id"`, `metric`
+(key/title/value_type), `period` (mode, date_from/date_to, requested_date_from/to,
+defaulted/adjusted/clamped, today), фактически применённый `ordering` и `columns`.
+Колонки имеют `key="metric:YYYY-MM-DD"`, title/hint, sortable, value_type, align,
+`empty_text="—"`, разреженный `values`, где ключ — UUID страницы, значение —
+`{text, value, hint}`. Пропуск означает отсутствие данных, не ноль.
+
+Поток: валидация → период → M4 ranking (только если сортируемая колонка есть)
+→ SQL выборка и count → M3 table (только для непустой выборки) → builder.
+M4 получает фактические границы колонки и направление asc/desc; SQL применяет
+поиск, ранг и пагинацию, страницы без статистики идут последними, затем
+`created_at DESC, id DESC`. Если колонки нет, M4 не вызывается, используется
+дефолтная сортировка и `metrics_table.ordering=null`. M3 получает все границы
+колонок и UUID текущей выборки; seo не агрегирует и не сортирует данные в памяти.
+На запрос — ровно 2 SQL и до 2 peer-вызовов; пустая выборка без metric ordering
+не вызывает peer, но сохраняет период и пустые values в ответе.
+
+Зависимость: ya-metrica-service M3 `/api/metrica/page-stats/table`, M4
+`/api/metrica/page-stats/ranking`. Передаётся tenant UUID без credentials.
+Любой не-200 (включая 400), timeout, транспортная ошибка или неверная схема
+peer → `502 {"detail":"Сервис статистики недоступен"}`, транзакция откатывается;
+тело/URL peer не возвращаются. «Запросы» от ya-metrica не зависят.
+
+| Env seo-service | Default | Назначение |
+|---|---|---|
+| `SEO_UTC_OFFSET_HOURS` | `3` | Целое −12..14; неверное значение блокирует запуск |
+| `YA_METRICA_SERVICE_URL` | `http://eqsitecms-ya-metrica-service:8000` | Внутренний peer |
+| `YA_METRICA_TIMEOUT_SECONDS` | `4` | Таймаут одного вызова, два последовательных ≤8 с (backend 10 с) |
+
+**Согласуйте `SEO_UTC_OFFSET_HOURS` с `YA_METRICA_UTC_OFFSET_HOURS` ya-metrica.**
+Сервисы читают только собственный env, автоматической синхронизации нет.
+HTTP-клиент использует `trust_env=False`, без cookie/Authorization.
 
 ## Запуск
 
@@ -126,7 +183,7 @@ standalone dev-контур (`fastapi-template`, postgres:16-alpine), не compo
 Из каталога сервиса:
 
 ```bash
-uv sync --locked  # dev-группа включает httpx для ASGI API-тестов
+uv sync --locked  # httpx — runtime-зависимость peer-клиента
 uv run pytest tests/unit tests/api
 make lint
 # Форматировать только изменяемые файлы, не весь сервис:
@@ -147,7 +204,8 @@ make test-infra  # IT репозиториев, включая concurrency; вм
 ```
 
 Каждый IT создаёт случайную схему `test_seo_<uuid>`, применяет реальные миграции и
-удаляет только свою схему в finally. Используйте выделенную тестовую БД/инстанс,
+удаляет только свою схему в finally, если не задан `TEST_KEEP_SCHEMA=1`.
+Для недеструктивного прогона задайте `TEST_KEEP_SCHEMA=1`: схемы остаются в тестовой БД. Используйте выделенную тестовую БД/инстанс,
 никогда рабочие данные. IT проверяют upgrade/downgrade/upgrade, constraints/hash/TEXT,
 идемпотентность, конкурентные batch, поиск/сортировку/tenant isolation и blacklists.
 Live smoke — отдельный этап, не часть этого тестового прогона.

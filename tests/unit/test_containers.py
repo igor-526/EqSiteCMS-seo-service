@@ -226,3 +226,36 @@ async def test_transaction_boundary_and_cleanup(monkeypatch: pytest.MonkeyPatch,
     assert not repositories.session.initialized
     session.commit.assert_not_awaited()
     session.rollback.assert_not_awaited()
+
+
+def test_metrics_providers_use_shared_settings_without_database() -> None:
+    from clients.ya_metrica import YaMetricaClient
+    from containers.clients import ClientsContainer
+    from core.protocols.clients.ya_metrica import YaMetricaClientProtocol
+    from core.services.metrics_period import MetricsPeriodResolver
+    from core.services.metrics_table.builder import MetricsTableBuilder
+    from settings import Settings
+
+    settings = SettingsContainer()
+    clients = ClientsContainer(settings_container=settings)
+    services = ServicesContainer(settings_container=settings)
+    custom = Settings(
+        YA_METRICA_SERVICE_URL="http://configured-peer", YA_METRICA_TIMEOUT_SECONDS=1.5, SEO_UTC_OFFSET_HOURS=-4
+    )
+    with settings.app_settings.override(providers.Object(custom)):
+        client: YaMetricaClientProtocol = clients.ya_metrica_client()
+        assert isinstance(client, YaMetricaClient)
+        assert client._base_url == "http://configured-peer" and client._timeout == 1.5
+        resolver = services.metrics_period_resolver()
+        assert isinstance(resolver, MetricsPeriodResolver) and resolver._utc_offset_hours == -4
+        table_builder = services.metrics_table_builder()
+        assert isinstance(table_builder, MetricsTableBuilder)
+        table = table_builder.build(period=resolver.resolve(), metric="visits", page_ids=[])
+        assert table.metric.key == "visits" and len(table.columns) == 7
+        assert isinstance(clients.ya_metrica_client, providers.Factory)
+        assert isinstance(services.metrics_period_resolver, providers.Factory)
+        assert isinstance(services.metrics_table_builder, providers.Factory)
+    assert isinstance(application.clients_container.ya_metrica_client(), YaMetricaClient)
+    assert isinstance(application.services_container.metrics_period_resolver(), MetricsPeriodResolver)
+    assert isinstance(application.services_container.metrics_table_builder(), MetricsTableBuilder)
+    assert not application.repositories_container.session.initialized

@@ -73,3 +73,29 @@ async def test_response_validation_failure_rolls_back(runtime_api: RuntimeApi, c
     assert response.json() == {"detail": "Внутренняя ошибка сервиса"}
     assert LEAK not in caplog.text
     assert runtime_api.events == ["open", "begin", "rollback", "close"]
+
+
+@pytest.mark.parametrize("operation", ["ranking", "table"])
+async def test_at_sp_04_peer_failure_is_safe_502_and_rollback(runtime_api, caplog, operation):
+    from dependency_injector import providers
+
+    from containers import services_container
+    from core.entities import Page
+    from core.exceptions import MetricaUnavailableError
+    from tests.unit.test_page_service import make_listing_service
+
+    service, repository, peer = make_listing_service()
+    repository.get_filtered.return_value = [Page(equestrian_id=TENANT_ID, page="/a")]
+    repository.count_filtered.return_value = 1
+    getattr(peer, operation).side_effect = MetricaUnavailableError(LEAK)
+    params = {"ordering": "metric:2026-10-26"} if operation == "ranking" else {}
+    with services_container.page_service.override(providers.Object(service)):
+        async with runtime_api.client() as client:
+            response = await client.get("/api/pages", headers={"X-Equestrian-Id": str(TENANT_ID)}, params=params)
+    assert response.status_code == 502
+    assert response.json() == {"detail": "Сервис статистики недоступен"}
+    assert LEAK not in response.text and LEAK not in caplog.text
+    assert runtime_api.events == ["open", "begin", "rollback", "close"]
+    if operation == "ranking":
+        assert repository.mock_calls == []
+        peer.table.assert_not_awaited()

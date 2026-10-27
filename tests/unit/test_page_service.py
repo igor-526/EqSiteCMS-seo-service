@@ -63,3 +63,106 @@ async def test_max_page_batch() -> None:
     )
     assert len(result.items) == 1000
     assert params.get_values.await_count == hashes.get_values.await_count == 1
+
+
+def make_listing_service(repository=None, client=None):
+    from datetime import UTC, datetime
+
+    from containers import services_container
+    from core.services.metrics_period import MetricsPeriodResolver
+
+    repository = repository if repository is not None else AsyncMock()
+    client = client if client is not None else AsyncMock()
+    from core.schemas.clients.ya_metrica import PageStatsTable
+
+    client.table.return_value = PageStatsTable(metric="visits", values=[])
+    resolver = MetricsPeriodResolver(clock=lambda: datetime(2026, 10, 26, 12, tzinfo=UTC))
+    return (
+        PageService(
+            repository,
+            PageNormalizer(),
+            AsyncMock(),
+            AsyncMock(),
+            ya_metrica_client=client,
+            metrics_period_resolver=resolver,
+            metrics_table_builder=services_container.metrics_table_builder(),
+        ),
+        repository,
+        client,
+    )
+
+
+@pytest.mark.parametrize("size", [0, 1, 50])
+async def test_ut_sp_11_table_once_for_whole_selection(size):
+    from core.entities import Page
+
+    service, repository, client = make_listing_service()
+    tenant = uuid4()
+    entities = [Page(equestrian_id=tenant, page=f"/{i}") for i in range(size)]
+    repository.get_filtered.return_value = entities
+    repository.count_filtered.return_value = 123
+    result = await service.list_filtered(equestrian_id=tenant, limit=50)
+    assert result.total == 123 and len(result.items) == size
+    assert len(result.metrics_table.columns) == 7
+    client.ranking.assert_not_awaited()
+    if size:
+        client.table.assert_awaited_once()
+        args = client.table.call_args.kwargs
+        assert args["equestrian_id"] == tenant and args["metric"] == "visits"
+        assert args["page_ids"] == [item.id for item in entities]
+        assert [c.key for c in args["columns"]] == [f"2026-10-{i}" for i in range(20, 27)]
+    else:
+        client.table.assert_not_awaited()
+        assert all(c.values == {} for c in result.metrics_table.columns)
+    repository.get_filtered.assert_awaited_once()
+    repository.count_filtered.assert_awaited_once()
+
+
+@pytest.mark.parametrize("ordering,direction", [("metric:2026-10-26", "asc"), ("-metric:2026-10-26", "desc")])
+async def test_ut_sp_12_ranking_sql_table_sequence(ordering, direction):
+    from datetime import date
+    from unittest.mock import Mock
+
+    from core.entities import Page
+    from core.schemas.clients.ya_metrica import PageStatsRanking
+
+    service, repository, client = make_listing_service()
+    tenant, page_id = uuid4(), uuid4()
+    repository.get_filtered.return_value = [Page(id=page_id, equestrian_id=tenant, page="/a")]
+    repository.count_filtered.return_value = 1
+    client.ranking.return_value = PageStatsRanking(metric="visits", direction=direction, page_ids=[page_id])
+    calls = Mock()
+    calls.attach_mock(client.ranking, "ranking")
+    calls.attach_mock(repository.get_filtered, "sql")
+    calls.attach_mock(repository.count_filtered, "count")
+    calls.attach_mock(client.table, "table")
+    result = await service.list_filtered(equestrian_id=tenant, mode="week", ordering=ordering, search=" a ")
+    client.ranking.assert_awaited_once_with(
+        equestrian_id=tenant,
+        metric="visits",
+        date_from=date(2026, 10, 26),
+        date_to=date(2026, 10, 26),
+        direction=direction,
+    )
+    repository.get_filtered.assert_awaited_once_with(
+        equestrian_id=tenant,
+        search="a",
+        ordering=None,
+        limit=20,
+        offset=0,
+        ranked_page_ids=[page_id],
+    )
+    assert [call[0] for call in calls.mock_calls] == ["ranking", "sql", "count", "table"]
+    assert result.metrics_table.ordering == ordering
+
+
+async def test_ut_sp_12_missing_column_falls_back_without_ranking():
+    service, repository, client = make_listing_service()
+    repository.get_filtered.return_value = []
+    repository.count_filtered.return_value = 0
+    result = await service.list_filtered(equestrian_id=uuid4(), ordering="metric:2026-09-01")
+    assert result.metrics_table.ordering is None
+    assert repository.get_filtered.call_args.kwargs["ordering"] is None
+    assert repository.get_filtered.call_args.kwargs["ranked_page_ids"] is None
+    client.ranking.assert_not_awaited()
+    client.table.assert_not_awaited()

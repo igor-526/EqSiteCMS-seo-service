@@ -1,14 +1,15 @@
 """Caller-provided PostgreSQL only; never import runtime settings."""
 
+import logging
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Iterator
 from pathlib import Path
 from uuid import uuid4
 
 import pytest
 from alembic import command
 from alembic.config import Config
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
@@ -38,7 +39,7 @@ async def empty_pg_engine() -> AsyncIterator[AsyncEngine]:
         yield engine
     finally:
         await engine.dispose()
-        if created:
+        if created and os.environ.get("TEST_KEEP_SCHEMA") != "1":
             # schema is generated locally, never derived from caller input.
             assert schema.startswith("test_seo_") and len(schema) == 41
             async with admin.begin() as connection:
@@ -82,3 +83,21 @@ async def pg_session(pg_engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
     async with AsyncSession(pg_engine) as session:
         yield session
         await session.rollback()
+
+
+@pytest.fixture
+def sql_log(pg_engine: AsyncEngine, caplog: pytest.LogCaptureFixture) -> Iterator[list[str]]:
+    """Record statements only, never bound values or connection configuration."""
+    statements: list[str] = []
+    logger = logging.getLogger("tests.seo.sql")
+    caplog.set_level(logging.INFO, logger=logger.name)
+
+    def record(_conn, _cursor, statement, _parameters, _context, _executemany) -> None:
+        statements.append(statement)
+        logger.info("SQL: %s", statement)
+
+    event.listen(pg_engine.sync_engine, "before_cursor_execute", record)
+    try:
+        yield statements
+    finally:
+        event.remove(pg_engine.sync_engine, "before_cursor_execute", record)
