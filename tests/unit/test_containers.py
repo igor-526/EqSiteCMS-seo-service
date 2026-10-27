@@ -259,3 +259,75 @@ def test_metrics_providers_use_shared_settings_without_database() -> None:
     assert isinstance(application.services_container.metrics_period_resolver(), MetricsPeriodResolver)
     assert isinstance(application.services_container.metrics_table_builder(), MetricsTableBuilder)
     assert not application.repositories_container.session.initialized
+
+
+def test_parse_registry_graph_and_registration_validation() -> None:
+    from clients.yandex_service import YandexServiceClient
+    from containers.clients import ClientsContainer
+    from providers.ya_metrica import YaMetricaParseProvider
+    from settings import ParseSettings
+
+    settings = SettingsContainer()
+    clients = ClientsContainer(settings_container=settings)
+    custom = ParseSettings(YANDEX_SERVICE_URL="http://configured-peer", YANDEX_SERVICE_TIMEOUT_SECONDS=2)
+    with settings.parse_settings.override(providers.Object(custom)):
+        registry = clients.parse_provider_registry()
+        assert clients.parse_provider_registry() is registry
+        provider = registry.get("ya_metrica")
+        assert isinstance(provider, YaMetricaParseProvider)
+        assert isinstance(provider._client, YandexServiceClient)
+        assert provider._client._base_url == "http://configured-peer"
+        assert provider._client._timeout == 2
+        assert registry.enabled() == [provider]
+    bad_clients = ClientsContainer(settings_container=settings)
+    custom = ParseSettings(PARSE_PROVIDERS_ENABLED="demo")
+    with settings.parse_settings.override(providers.Object(custom)):
+        with pytest.raises(ValueError, match="unregistered provider"):
+            bad_clients.parse_provider_registry()
+    assert application.clients_container.parse_provider_registry().get("ya_metrica").code == "ya_metrica"
+    assert not application.repositories_container.session.initialized
+
+
+def test_dispatch_graph_shares_client_settings_registry_without_request_session() -> None:
+    from datetime import UTC, date, datetime, timedelta
+
+    from clients.nats import NatsJetstreamClient, ParseCommandPublisher
+    from containers.clients import ClientsContainer
+    from core.services.parsing import EnvTimezoneProvider, ParseDispatchService, SlotCalculator
+    from repositories import ParseDispatchRepository
+    from settings import ParseSettings, Settings
+
+    settings = SettingsContainer()
+    clients = ClientsContainer(settings_container=settings)
+    repositories = RepositoriesContainer()
+    services = ServicesContainer(
+        settings_container=settings, clients_container=clients, repositories_container=repositories
+    )
+    with (
+        settings.app_settings.override(providers.Object(Settings(SEO_UTC_OFFSET_HOURS=14))),
+        settings.parse_settings.override(
+            providers.Object(
+                ParseSettings(PARSE_SCHEDULE_TIME="04:00", PARSE_TARGETS_PAGE_SIZE=7, PARSE_DISPATCH_MAX_ATTEMPTS=4)
+            )
+        ),
+    ):
+        service = services.parse_dispatch_service()
+        assert isinstance(service, ParseDispatchService)
+        assert isinstance(service._repository, ParseDispatchRepository)
+        assert isinstance(service._slots, SlotCalculator)
+        assert service._slots.local_now(utc_now=datetime(2026, 10, 28, 14, tzinfo=UTC)).date() == date(2026, 10, 29)
+        assert isinstance(service._publisher, ParseCommandPublisher)
+        assert isinstance(service._publisher._client, NatsJetstreamClient)
+        assert service._publisher._client is clients.nats_client()
+        assert service._registry is clients.parse_provider_registry()
+        assert service._page_size == 7 and service._max_attempts == 4
+        assert service._lease == timedelta(minutes=5)
+        assert not clients.nats_client().is_connected
+        assert isinstance(services.timezone_provider(), EnvTimezoneProvider)
+        calculator = services.slot_calculator()
+        assert isinstance(calculator, SlotCalculator)
+        assert calculator.due_slot(utc_now=datetime(2026, 10, 28, 14, tzinfo=UTC)) == date(2026, 10, 29)
+        assert calculator.due_slot(utc_now=datetime(2026, 10, 28, 13, tzinfo=UTC)) is None
+    assert isinstance(application.services_container.parse_dispatch_service(), ParseDispatchService)
+    assert not repositories.session.initialized
+    assert not application.repositories_container.session.initialized

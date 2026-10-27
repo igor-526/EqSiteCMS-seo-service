@@ -8,8 +8,18 @@ from .base import (
     RepositoryError,
     UnauthorizedError,
 )
+from .parsing import (
+    ParseProviderUnknownError,
+    ParseQueueUnavailableError,
+    ParseTargetMissingError,
+    ParseTargetsUnavailableError,
+)
 
 __all__ = [
+    "ParseProviderUnknownError",
+    "ParseTargetMissingError",
+    "ParseTargetsUnavailableError",
+    "ParseQueueUnavailableError",
     "AlreadyExistsError",
     "AppError",
     "ClientError",

@@ -10,6 +10,7 @@ dependencies = [
     "dependency-injector>=4.49.1",
     "fastapi>=0.116",
     "httpx>=0.28.1",
+    "nats-py>=2.15.0",
     "pydantic-settings>=2.10",
     "sentry-sdk[fastapi,sqlalchemy]>=2.47",
     "sqlalchemy>=2.0",
@@ -45,7 +46,7 @@ extend-exclude = [".github", ".helm"]
 select = ["E", "F", "I", "UP", "B", "ASYNC"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["api", "containers", "core", "depends", "models", "repositories", "settings", "utils"]
+known-first-party = ["api", "containers", "core", "depends", "models", "repositories", "scheduler", "settings", "utils"]
 
 [tool.ruff.format]
 quote-style = "double"

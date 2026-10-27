@@ -2,14 +2,15 @@ from collections.abc import AsyncIterator, Iterator
 from contextlib import ExitStack, asynccontextmanager
 from typing import Any, cast
 from unittest.mock import AsyncMock, Mock
-from uuid import UUID
+from uuid import UUID, uuid4
 
 import httpx
 import pytest
 from dependency_injector import providers
 
-from api import blacklisted_hashes, blacklisted_query_params, pages, search_queries
+from api import blacklisted_hashes, blacklisted_query_params, pages, parse_jobs, search_queries
 from containers import repositories_container, services_container
+from core.services.parsing import AcceptedParseJob
 from depends import utils as session_dependencies
 from main import app
 
@@ -52,12 +53,16 @@ class RuntimeApi:
         self.events: list[str] = []
         self.services: dict[str, Mock] = {}
         for name in (
+            "parse_dispatch_service",
             "search_query_service",
             "page_service",
             "blacklisted_query_param_service",
             "blacklisted_hash_service",
         ):
             service = Mock()
+            service.dispatch_manual = AsyncMock(
+                side_effect=lambda **kwargs: AcceptedParseJob(job_id=uuid4(), provider=kwargs["provider"])
+            )
             service.resolve = AsyncMock(return_value={"items": []})
             service.list_filtered = AsyncMock(return_value={"items": [], "total": 0})
             service.list_all = AsyncMock(return_value={"items": [ITEM], "total": 1})
@@ -78,7 +83,7 @@ class RuntimeApi:
 
 @pytest.fixture
 def runtime_api(monkeypatch: pytest.MonkeyPatch) -> Iterator[RuntimeApi]:
-    services_container.wire(modules=[search_queries, pages, blacklisted_query_params, blacklisted_hashes])
+    services_container.wire(modules=[search_queries, pages, blacklisted_query_params, blacklisted_hashes, parse_jobs])
     # Async mode is sticky in dependency-injector, even after resource shutdown.
     # Restore provider modes so API calls cannot pollute later synchronous DI tests.
     provider_modes: list[tuple[providers.Provider[Any], bool, bool]] = [

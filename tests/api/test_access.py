@@ -11,6 +11,8 @@ def request_path(path: str) -> str:
 
 
 def request_body(path: str) -> dict:
+    if path == "/api/parse-jobs":
+        return {"provider": "ya_metrica"}
     return {"items": ["horse"]} if path.endswith("/resolve") else {"value": "top"}
 
 
@@ -22,6 +24,8 @@ async def test_credentials_do_not_affect_access(runtime_api: RuntimeApi, method:
     async with runtime_api.client() as client:
         response = await client.request(method, request_path(path), headers=headers, json=request_body(path))
     expected = 204 if method == "DELETE" else 201 if method == "POST" and not path.endswith("/resolve") else 200
+    if path == "/api/parse-jobs":
+        expected = 202
     assert response.status_code == expected, response.text
     calls = [call for service in runtime_api.services.values() for call in service.mock_calls]
     assert len(calls) == 1
@@ -66,8 +70,8 @@ async def test_body_cannot_override_tenant(runtime_api: RuntimeApi, path: str):
 
 
 def test_route_inventory():
-    assert len(API_ROUTES) == 12
-    assert len(set(API_ROUTES)) == 12
+    assert len(API_ROUTES) == 13
+    assert len(set(API_ROUTES)) == 13
 
 
 @pytest.mark.parametrize("selector", [None, "not-a-uuid"])

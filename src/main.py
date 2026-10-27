@@ -1,5 +1,6 @@
+import asyncio
 import logging
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 
 from fastapi import APIRouter, Depends, FastAPI, Request
 from fastapi.exceptions import RequestValidationError, ResponseValidationError
@@ -14,9 +15,12 @@ from api import (
     blacklisted_query_params_router,
     pages,
     pages_router,
+    parse_jobs,
+    parse_jobs_router,
     search_queries,
     search_queries_router,
 )
+from clients.nats.client import NatsJetstreamClient
 from containers import services_container
 from containers.application import clients_container
 from core.exceptions import AppError, MetricaUnavailableError
@@ -29,12 +33,35 @@ configure_sentry()
 logger = logging.getLogger(__name__)
 
 
+async def setup_nats(client: NatsJetstreamClient) -> None:
+    """Retry initial connection/topology without delaying HTTP readiness."""
+    delay = 1
+    while True:
+        try:
+            await client.connect()
+            await client.setup_streams()
+            return
+        except Exception:
+            # Never expose connection parameters or server responses in logs.
+            logger.warning("parse_queue_setup_unavailable")
+        await asyncio.sleep(delay)
+        delay = min(delay * 2, 30)
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    client = clients_container.nats_client()
+    startup = asyncio.create_task(setup_nats(client), name="parse-queue-startup")
     try:
         yield
     finally:
-        await close_database()
+        startup.cancel()
+        try:
+            with suppress(asyncio.CancelledError):
+                await startup
+            await client.close()
+        finally:
+            await close_database()
 
 
 # Composition root: shared settings and peer providers, without repository changes.
@@ -48,7 +75,7 @@ services_container.search_query_service.add_kwargs(
     metrics_period_resolver=services_container.metrics_period_resolver,
     metrics_table_builder=services_container.metrics_table_builder,
 )
-services_container.wire(modules=[search_queries, pages, blacklisted_query_params, blacklisted_hashes])
+services_container.wire(modules=[search_queries, pages, blacklisted_query_params, blacklisted_hashes, parse_jobs])
 
 
 class SafeHttpErrorBoundary:
@@ -85,6 +112,7 @@ app.state.container = services_container
 router = APIRouter(prefix="/api", dependencies=[Depends(get_equestrian_id)])
 router.include_router(search_queries_router, prefix="/search-queries")
 router.include_router(pages_router, prefix="/pages")
+router.include_router(parse_jobs_router, prefix="/parse-jobs")
 router.include_router(blacklisted_query_params_router, prefix="/page-normalization/blacklisted-query-params")
 router.include_router(blacklisted_hashes_router, prefix="/page-normalization/blacklisted-hashes")
 app.include_router(router)
@@ -107,6 +135,7 @@ async def validation_error_handler(_: Request, exc: RequestValidationError) -> J
     # Unknown field names can be attacker-controlled too; redact them in loc.
     safe_keys = {
         "body",
+        "provider",
         "query",
         "path",
         "header",

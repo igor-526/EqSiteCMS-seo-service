@@ -453,6 +453,15 @@ wheels = [
 ]
 
 [[package]]
+name = "nats-py"
+version = "2.16.0"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/2c/c8/739b72c9201081e48000884d476231873ac82f7247c43b33823eaf3c0bfb/nats_py-2.16.0.tar.gz", hash = "sha256:1d137ed7afc9b59033b3199324c6237df2016a5091935871344a787eba6b72fc", size = 79731, upload-time = "2026-09-16T07:47:21.843Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/48/a3/16cec37172144d3362d7551bb823a098b2b2903281fc095dfe4480b8c2fd/nats_py-2.16.0-py3-none-any.whl", hash = "sha256:aeb1ff123966c05833d26c7df7e1d54c1c6d32b612428b21677a2e921f1fecae", size = 93578, upload-time = "2026-09-16T07:47:20.799Z" },
+]
+
+[[package]]
 name = "nodejs-wheel-binaries"
 version = "24.16.0"
 source = { registry = "https://pypi.org/simple" }
@@ -711,6 +720,7 @@ dependencies = [
     { name = "dependency-injector" },
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "nats-py" },
     { name = "pydantic-settings" },
     { name = "sentry-sdk", extra = ["fastapi", "sqlalchemy"] },
     { name = "sqlalchemy" },
@@ -735,6 +745,7 @@ requires-dist = [
     { name = "dependency-injector", specifier = ">=4.49.1" },
     { name = "fastapi", specifier = ">=0.116" },
     { name = "httpx", specifier = ">=0.28.1" },
+    { name = "nats-py", specifier = ">=2.15.0" },
     { name = "pydantic-settings", specifier = ">=2.10" },
     { name = "sentry-sdk", extras = ["fastapi", "sqlalchemy"], specifier = ">=2.47" },
     { name = "sqlalchemy", specifier = ">=2.0" },

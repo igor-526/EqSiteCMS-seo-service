@@ -3,6 +3,7 @@
 Внутренний FastAPI-сервис EqSiteCMS: нормализация поисковых запросов и страниц,
 пакетный find-or-create со стабильными UUID, списки с поиском/пагинацией и два
 независимых черных списка нормализации страниц для каждой конюшни.
+Оркестрирует ручные и ежедневные команды парсинга через NATS JetStream.
 Настройки не изменяют ранее сохранённые страницы. API изменения/удаления запросов и страниц нет.
 
 ## Стек и архитектура
@@ -13,6 +14,7 @@ Dependency Injector. Sentry опционален (`SENTRY_ENABLED`, `SENTRY_DSN`
 ```text
 src/
 ├── api/                  # HTTP, tenant preflight, транзакционные маршруты
+├── clients/              # NATS publisher и private peer HTTP клиенты
 ├── containers/           # settings/repositories/services, request-local session
 ├── core/
 │   ├── entities/         # сущности и PaginatedEntities
@@ -23,6 +25,8 @@ src/
 ├── depends/              # tenant selector и session lifecycle
 ├── models/               # SQLAlchemy Core tables
 ├── repositories/         # PostgreSQL, tenant isolation, find-or-create
+├── providers/            # ParseProviderProtocol implementations
+├── scheduler/            # отдельный процесс, без HTTP
 ├── migration/            # Alembic revisions
 ├── utils/                # инфраструктура и TransactionalRoute
 ├── main.py               # wiring, routers, error boundary, health
@@ -57,6 +61,7 @@ Host-порт `EXPOSE_SEO_SERVICE_PORT` предназначен только д
 |---|---|---|---|---|---|
 | GET | `/health` | Public Read | любой | `200` | то же |
 | POST | `/api/search-queries/resolve` | ITN Write (исключение) | парсеры | `200`; tenant `401`; body `400` | то же |
+| POST | `/api/parse-jobs` | ITN Write (исключение) | backend | selector missing/invalid `401` до body; valid selector `202`; body/provider/нет привязки `400`; источник целей `502`; очередь `503` | то же, credentials игнорируются |
 | POST | `/api/pages/resolve` | ITN Write (исключение) | парсеры | `200`; tenant `401`; body `400` | то же |
 | GET | `/api/search-queries` | ITN Read (исключение) | backend | `200` с `metrics_table`; tenant `401` до БД/peer; query `400` до peer; сбой peer `502` | то же |
 | GET | `/api/pages` | ITN Read (исключение) | backend | `200` с `metrics_table`; tenant `401` до БД/peer; query `400` до peer; сбой peer `502` | то же |
@@ -73,7 +78,7 @@ Host-порт `EXPOSE_SEO_SERVICE_PORT` предназначен только д
 Для валидации `400` detail — список `{type: "request_validation", loc: [...],
 msg: "Некорректные параметры запроса"}` без input/ctx. Иные ошибки содержат безопасную
 строку класса, `500` — `"Внутренняя ошибка сервиса"`; SQL, входные значения,
-traceback и параметры подключения не возвращаются. Одна транзакция на запрос:
+traceback и параметры подключения не возвращаются. Одна транзакция на обычный запрос (ledger парсинга — отдельные короткие транзакции):
 commit до успешного ответа, rollback при ошибке. `204` не содержит тела.
 Health статический `{"status":"ok"}`, без обращения к БД.
 
@@ -182,6 +187,124 @@ timeout/transport/schema/metric/direction mismatch → безопасный `502
 Сервисы читают только собственный env, автоматической синхронизации нет.
 HTTP-клиент использует `trust_env=False`, без cookie/Authorization.
 
+## Ручной запуск парсинга
+
+`POST /api/parse-jobs`, JSON ровно `{"provider":"ya_metrica"}` и UUID
+`X-Equestrian-Id`. Код — `^[a-z][a-z0-9_]{1,31}$`, лишние поля запрещены.
+Конюшня берётся только из selector, не из body/query. После успешного PubAck и
+аудита ledger ответ `202 {"job_id":"UUID","provider":"ya_metrica","status":"accepted"}`.
+Это подтверждение постановки в очередь, не окончания парсинга: при уже активном
+запуске исполнитель может подтвердить команду без нового запуска.
+Неизвестный/отключённый провайдер, отсутствие привязки и невалидное тело → `400`;
+недоступность yandex → `502`, NATS → `503` с безопасным detail.
+
+CMS вызывает только backend `POST /api/seo/parse-jobs` (Protected Write): anonymous
+`401`, только ADMIN `202`, остальные роли, включая SUPERUSER/DEVELOPER без ADMIN,
+`403` до downstream/body. Backend берёт tenant из actor и передаёт только selector,
+не credentials; upstream ошибки `400/502/503` сохраняют безопасный контракт.
+
+## NATS JetStream
+
+| Stream | Subject | Durable потребителя | Назначение | Роль |
+|---|---|---|---|---|
+| `PARSE_COMMANDS` | `commands.parse.ya_metrica.run` | `ya-metrica-parse-run` | Парсинг статистики конюшни | исходящий (Publisher) |
+
+Канонический producer-контракт — [docs/asyncapi.yaml](docs/asyncapi.yaml), consumer —
+`services/ya-metrica-service/docs/asyncapi.yaml`; из корня: `make asyncapi-validate-parse`.
+API и scheduler используют общий клиент и идемпотентный `add_stream`: wildcard
+`commands.parse.>`, FILE, LIMITS, max_age 604800 с (7 суток). Consumer создаёт только
+свой durable: filter `commands.parse.ya_metrica.run`, explicit ack, deliver all,
+ack_wait 30 с, max_deliver 5. Прямого HTTP-запуска парсинга в ya-metrica нет.
+
+Envelope: `schema_version=1`, timezone-aware `occurred_at`, `job_id`, `provider`,
+`equestrian_id`, `trigger=schedule|manual`, `window`, `params`; лишние поля запрещены.
+Текущие dispatch-пути публикуют `window={"mode":"auto"}`, `params={}`; контракт также
+описывает explicit-окно с парой дат. Даты вычисляет исполнитель, не seo: при
+вчерашней последней статистике — вчера..сегодня, без статистики — последние 2 года.
+
+`NAMESPACE_PARSE_COMMANDS = uuid5(NAMESPACE_DNS, "parse-commands.eqcms")` в обоих
+сервисах. Schedule job_id = uuid5(namespace,
+`"schedule:<provider>:<equestrian_id>:<локальная дата YYYY-MM-DD>"`), manual — uuid4.
+`Nats-Msg-Id = uuid5(namespace, "<provider>:<job_id>")`; `PubAck.duplicate` проверяется
+и логируется warning. Дополнительно consumer дедуплицирует сохранённый job_id.
+Секретов, ciphertext, профиля и ID аккаунта Яндекса в команде нет.
+
+NATS — Internal Trusted Network Write без auth, не Public API. **Production release
+блокируется до подтверждения внешней недоступности peers, NATS и БД**; наличие
+Compose network/успешных тестов этого не доказывает. Сетевые настройки здесь не меняются.
+Недоступный NATS не блокирует HTTP startup/статический health: фоновый connect/setup
+повторяется с backoff; scheduler также повторяет подключение и корректно останавливается.
+
+## Расписание, ledger и настройки
+
+Один отдельный процесс `seo-scheduler`, без HTTP/портов, тот же образ и собственный
+`.env` seo-service. Локальный запуск: `PYTHONPATH=src uv run python -m scheduler.main`.
+SIGTERM/SIGINT останавливают worker, закрывают NATS и сессии/engine БД.
+
+| Env | Default | Назначение |
+|---|---|---|
+| `PARSE_SCHEDULE_ENABLED` | `true` | false отключает только расписание |
+| `PARSE_SCHEDULE_TIME` | `03:00` | Строго HH:MM, локальное время |
+| `PARSE_SCHEDULER_TICK_SECONDS` | `30` | Положительный интервал tick |
+| `PARSE_PROVIDERS_ENABLED` | `ya_metrica` | CSV уникальных зарегистрированных кодов |
+| `PARSE_TARGETS_PAGE_SIZE` | `100` | Размер страницы целей, 1..500 |
+| `PARSE_DISPATCH_MAX_ATTEMPTS` | `5` | Лимит повторов failed-публикации |
+| `YANDEX_SERVICE_URL` | `http://eqsitecms-yandex-service:8000` | Private peer источник привязок |
+| `YANDEX_SERVICE_TIMEOUT_SECONDS` | `4` | Положительный timeout |
+| `NATS_SERVERS` | `nats://eqsitecms-nats:4222` | CSV адресов брокера |
+| `NATS_STREAM_PARSE_COMMANDS` | `PARSE_COMMANDS` | Stream-владелец seo |
+| `NATS_SUBJECTS_PARSE_COMMANDS` | `commands.parse.>` | CSV subjects stream |
+| `NATS_PARSE_COMMANDS_MAX_AGE_SECONDS` | `604800` | Хранение команд |
+| `NATS_PUBLISH_TIMEOUT_SECONDS` | `5` | Timeout PubAck |
+| `NATS_ERROR_REPORT_AFTER_ATTEMPTS` | `3` | Порог эскалации ошибки соединения |
+| `NATS_SETUP_MAX_ATTEMPTS` | `10` | Число попыток topology setup за вызов |
+| `NATS_SETUP_BACKOFF_SECONDS` | `2` | База backoff topology setup |
+
+Начальные connect/setup дополнительно повторяются supervisor с backoff 1..30 с.
+Невалидные настройки/неизвестный enabled provider отклоняются при старте/сборке DI.
+Пример — [.env.example](.env.example); реальные env меняет только оператор.
+
+Слот наступает при локальном времени ≥ расписания; дата слота — локальная дата.
+Текущий слот догоняется до конца суток, вчерашний не переносится на завтра.
+`SEO_UTC_OFFSET_HOURS` (−12..14, default +3) — общий пояс конюшен, тот же источник
+«сегодня», что у метрик. **Он должен совпадать с `YA_METRICA_UTC_OFFSET_HOURS`**:
+автосинхронизации нет, расхождение может сдвинуть окно на сутки. Расширение под
+пояс конюшни — `TimezoneProvider.utc_offset_hours(equestrian_id)`.
+
+`YaMetricaParseProvider` получает цели постранично через credential-less Private
+Peer Read `GET /api/connections/metrica?limit=100&offset=0` yandex-service:
+`{total, items:[{equestrian_id,counter_id}]}`, ORDER BY equestrian_id, default limit
+100, допустимо 1..500, offset ≥0 (нарушение → `400`). Anonymous и с credentials —
+одинаковый `200`; credentials игнорируются. Это внутренний реестр, не Public Read
+для сайтов. Ручной preflight использует GET привязки по equestrian_id.
+
+Ledger `parse_dispatches` в PostgreSQL seo: `pending/published/failed`, attempts,
+безопасный last_error_code, timestamps. Partial unique index
+`(provider,equestrian_id,schedule_date) WHERE trigger='schedule'` и атомарный claim
+разделяют конкурентных scheduler. Порядок: claim → publish → mark, отдельные короткие
+транзакции; failed повторяется до cap, stale pending возвращается после lease 5 мин.
+После рестарта опубликованные цели пропускаются; детерминированный job_id сохраняется.
+Это не гарантия exactly-once доставки: сбой после PubAck до mark покрывается повтором
+и дедупликацией broker/consumer. Manual audit записывается после PubAck, без занятия
+слота; при ошибке брокера записи нет. Ошибка цели не останавливает остальных;
+ошибка списка/незавершённый проход не кэширует слот, следующий tick повторяет его.
+
+### Как подключить нового провайдера парсинга
+
+1. Реализовать `ParseProviderProtocol` в `providers/`: `code`, subject
+   `commands.parse.<code>.run`, async `list_targets(*,offset,limit)` →
+   `(list[ParseTarget], total)`, async `is_target(*,equestrian_id)` и
+   `build_params(*,trigger)`. Клиент источника целей — через отдельный Protocol/DI.
+2. Зарегистрировать провайдера в реестре DI (`containers/clients.py`; общий dispatch —
+   `containers/services.py`), включить code в `PARSE_PROVIDERS_ENABLED`. Дубли и
+   незарегистрированные коды отвергаются; registered, но disabled → API `400`.
+3. В исполнителе создать durable с filter `commands.parse.<code>.run` и handler:
+   валидировать envelope/subject/params, обеспечить job_id idempotency и ack/nak/term.
+4. Добавить канал producer/consumer AsyncAPI, обновить README и выполнить validator,
+   provider/dispatch unit tests и реальный broker gate с изолированными ресурсами.
+
+Stream/wildcard, envelope, scheduler, API, ledger и общий dispatch менять не нужно.
+
 ## Запуск
 
 Из корня монорепозитория, после настройки локальных env и общей БД/сети:
@@ -192,9 +315,11 @@ make seo
 ```
 
 Монорепозиторий использует `.docker-compose/docker-compose.seo.yml` с сервисами
-`seo-service` и `seo-migration`. Миграции запускайте через `seo-migration` с той же
+`seo-service`, `seo-scheduler` и `seo-migration`. Миграции запускайте через `seo-migration` с той же
 compose-конфигурацией/env, что и приложение; `SKIP_MIGRATIONS` не должен быть `true`.
 `scripts/stackctl` пока не поддерживает seo: используйте штатные make/docker compose.
+До старта API/scheduler должны быть готовы БД, миграции и внутренняя сеть;
+NATS/yandex нужны для dispatch. Compose не обеспечивает migration readiness barrier.
 Backend использует `SEO_SERVICE_URL=http://eqsitecms-seo-service:8000` по умолчанию.
 
 Локально из каталога сервиса (PostgreSQL настраивается через локальный env):
@@ -240,3 +365,15 @@ make test-infra  # IT репозиториев, включая concurrency; вм
 никогда рабочие данные. IT проверяют upgrade/downgrade/upgrade, constraints/hash/TEXT,
 идемпотентность, конкурентные batch, поиск/сортировку/tenant isolation и blacklists.
 Live smoke — отдельный этап, не часть этого тестового прогона.
+
+Broker gate (из корня, отдельный от default suite):
+
+```bash
+TEST_NATS_URL=nats://127.0.0.1:4222 uv run --directory services/seo-service pytest -m infrastructure tests/integration/test_nats_broker.py -q
+make asyncapi-validate-parse
+```
+
+Отсутствие env/реального JetStream — FAIL, не skip. Тест использует уникальные
+stream/subjects и обязательный cleanup, проверяет FILE/LIMITS/max_age,
+идемпотентный add_stream, публикацию и duplicate; consumer broker gate отдельно
+проверяет durable/filter/ack/nak/redelivery/max_deliver/term в ya-metrica-service.

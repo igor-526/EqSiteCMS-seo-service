@@ -14,11 +14,31 @@ from core.services.metrics_table.builder import MetricsTableBuilder
 from core.services.metrics_table.header_formatter import PeriodHeaderFormatter
 from core.services.metrics_table.registry import MetricRegistry
 from core.services.metrics_table.value_formatter import MetricValueFormatter
+from core.services.parsing import EnvTimezoneProvider, ParseDispatchService, SlotCalculator
 
 
 class ServicesContainer(containers.DeclarativeContainer):
     repositories_container = providers.DependenciesContainer()
     settings_container = providers.Container(SettingsContainer)
+    clients_container = providers.DependenciesContainer()
+
+    timezone_provider = providers.Factory(
+        EnvTimezoneProvider, utc_offset_hours=settings_container.app_settings.provided.seo_utc_offset_hours
+    )
+    slot_calculator = providers.Factory(
+        SlotCalculator,
+        timezone_provider=timezone_provider,
+        schedule_time=settings_container.parse_settings.provided.schedule_time,
+    )
+    parse_dispatch_service = providers.Factory(
+        ParseDispatchService,
+        slots=slot_calculator,
+        publisher=clients_container.parse_command_publisher,
+        repository=repositories_container.parse_dispatch_repository,
+        registry=clients_container.parse_provider_registry,
+        page_size=settings_container.parse_settings.provided.parse_targets_page_size,
+        max_attempts=settings_container.parse_settings.provided.parse_dispatch_max_attempts,
+    )
 
     metrics_period_resolver = providers.Factory(
         MetricsPeriodResolver, utc_offset_hours=settings_container.app_settings.provided.seo_utc_offset_hours
