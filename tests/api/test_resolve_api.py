@@ -17,7 +17,13 @@ def resolve_case(request, runtime_api: RuntimeApi):
     params.get_values.return_value = frozenset({"utm_source"})
     hashes.get_values.return_value = frozenset({"top"})
     service = (
-        PageService(repository, PageNormalizer(), params, hashes)
+        PageService(
+            repository,
+            PageNormalizer(),
+            params,
+            hashes,
+            normalization_service=AsyncMock(canonical_ids=AsyncMock(side_effect=lambda **kwargs: kwargs["ids"])),
+        )
         if pages
         else SearchQueryService(repository, SearchQueryNormalizer())
     )

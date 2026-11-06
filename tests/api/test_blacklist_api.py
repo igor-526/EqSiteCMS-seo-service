@@ -82,9 +82,9 @@ async def test_invalid_value_with_real_service(runtime_api: RuntimeApi, blacklis
     resource, name = blacklist_case
     repository = AsyncMock()
     service = (
-        BlacklistedHashService(repository)
+        BlacklistedHashService(repository, normalization_service=AsyncMock())
         if resource == "blacklisted-hashes"
-        else BlacklistedQueryParamService(repository)
+        else BlacklistedQueryParamService(repository, normalization_service=AsyncMock())
     )
     runtime_api.services[name].create.side_effect = service.create
     async with runtime_api.client() as client:
@@ -101,9 +101,9 @@ async def test_foreign_or_missing_is_404_before_mutation(runtime_api: RuntimeApi
     repository = AsyncMock()
     repository.get_by_id.return_value = None
     service = (
-        BlacklistedHashService(repository)
+        BlacklistedHashService(repository, normalization_service=AsyncMock())
         if resource == "blacklisted-hashes"
-        else BlacklistedQueryParamService(repository)
+        else BlacklistedQueryParamService(repository, normalization_service=AsyncMock())
     )
     operation = "update" if method == "PATCH" else "delete"
     getattr(runtime_api.services[name], operation).side_effect = getattr(service, operation)

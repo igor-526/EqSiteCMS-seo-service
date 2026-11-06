@@ -7,9 +7,17 @@ from core.exceptions import AlreadyExistsError, ClientError, NotFoundError
 from core.protocols.repositories import BlacklistedQueryParamRepositoryProtocol
 from core.schemas.api import BlacklistItemInDto, BlacklistItemOutDto
 
+from .normalization_service import NormalizationService
+
 
 class BlacklistedQueryParamService:
-    def __init__(self, blacklisted_query_param_repository: BlacklistedQueryParamRepositoryProtocol) -> None:
+    def __init__(
+        self,
+        blacklisted_query_param_repository: BlacklistedQueryParamRepositoryProtocol,
+        *,
+        normalization_service: NormalizationService,
+    ) -> None:
+        self._normalization = normalization_service
         self._blacklisted_query_param_repository = blacklisted_query_param_repository
 
     @staticmethod
@@ -28,14 +36,17 @@ class BlacklistedQueryParamService:
 
     async def create(self, *, equestrian_id: UUID, data: BlacklistItemInDto) -> BlacklistItemOutDto:
         value = self._normalize(data.value)
+        await self._normalization.lock(equestrian_id=equestrian_id)
         if await self._blacklisted_query_param_repository.get_by_value(value, equestrian_id=equestrian_id):
             raise AlreadyExistsError()
         entity = await self._blacklisted_query_param_repository.create(
             BlacklistedQueryParam(equestrian_id=equestrian_id, value=value), equestrian_id=equestrian_id
         )
+        await self._normalization.plan(equestrian_id=equestrian_id)
         return BlacklistItemOutDto.model_validate(entity)
 
     async def update(self, *, equestrian_id: UUID, item_id: UUID, data: BlacklistItemInDto) -> BlacklistItemOutDto:
+        await self._normalization.lock(equestrian_id=equestrian_id)
         entity = await self._blacklisted_query_param_repository.get_by_id(item_id, equestrian_id=equestrian_id)
         if entity is None:
             raise NotFoundError()
@@ -48,6 +59,7 @@ class BlacklistedQueryParamService:
         return BlacklistItemOutDto.model_validate(saved)
 
     async def delete(self, *, equestrian_id: UUID, item_id: UUID) -> None:
+        await self._normalization.lock(equestrian_id=equestrian_id)
         if await self._blacklisted_query_param_repository.get_by_id(item_id, equestrian_id=equestrian_id) is None:
             raise NotFoundError()
         await self._blacklisted_query_param_repository.delete(item_id, equestrian_id=equestrian_id)

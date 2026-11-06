@@ -14,13 +14,15 @@ from utils.basemodel import metadata
 
 pytestmark = pytest.mark.infrastructure
 
-TABLES = {"search_queries", "pages", "blacklisted_query_params", "blacklisted_hashes", "parse_dispatches"}
+TABLES = set(metadata.tables)
 
 
-async def test_migration_round_trip(empty_pg_engine: AsyncEngine, migration_config: Config) -> None:
+async def test_migration_round_trip(
+    empty_pg_engine: AsyncEngine, migration_config: Config, qa_infra_context: dict
+) -> None:
     async with empty_pg_engine.begin() as connection:
         schema = await connection.scalar(text("SELECT current_schema()"))
-        assert schema.startswith("test_seo_")
+        assert schema == qa_infra_context["resource"]["schema"]
         migration_config.attributes["schema"] = schema
 
         def round_trip(conn: Connection) -> None:
@@ -34,7 +36,7 @@ async def test_migration_round_trip(empty_pg_engine: AsyncEngine, migration_conf
                 command.upgrade(migration_config, target)
                 inspector = inspect(conn)
                 assert set(inspector.get_table_names(schema=schema)) == TABLES | {"alembic_version"}
-                assert conn.scalar(text(f'SELECT version_num FROM "{schema}".alembic_version')) == "20261028_0003"
+                assert conn.scalar(text(f'SELECT version_num FROM "{schema}".alembic_version')) == "20261102_0004"
                 for table in TABLES:
                     indexes = {index["name"]: index for index in inspector.get_indexes(table, schema=schema)}
                     if table in ("pages", "search_queries"):
@@ -42,13 +44,13 @@ async def test_migration_round_trip(empty_pg_engine: AsyncEngine, migration_conf
                         unique = f"ux_{table}_equestrian_id_{field}_hash"
                         assert indexes[unique]["unique"]
                         assert indexes[unique]["column_names"] == ["equestrian_id", f"{field}_hash"]
-                        trgm = indexes[f"ix_{table}_{field}_trgm"]["dialect_options"]
+                        trgm = indexes[f"ix_{table}_{field}_trgm"].get("dialect_options", {})
                         assert trgm["postgresql_using"] == "gin"
                         assert trgm["postgresql_ops"] == {field: "gin_trgm_ops"}
                         ordering = indexes[f"ix_{table}_equestrian_id_created_at"]
                         assert ordering["column_names"] == ["equestrian_id", "created_at", "id"]
-                        assert ordering["column_sorting"] == {"created_at": ("desc",), "id": ("desc",)}
-                    elif table != "parse_dispatches":
+                        assert ordering.get("column_sorting", {}) == {"created_at": ("desc",), "id": ("desc",)}
+                    elif table in ("blacklisted_hashes", "blacklisted_query_params"):
                         index = indexes[f"ux_{table}_equestrian_id_value"]
                         assert index["unique"] and index["column_names"] == ["equestrian_id", "value"]
                 # Compare ORM with the migrated schema, excluding public/runtime tables.
@@ -68,6 +70,7 @@ async def test_migration_round_trip(empty_pg_engine: AsyncEngine, migration_conf
 async def test_it_ps_01_ledger_constraints_and_reversible_migration(
     pg_engine: AsyncEngine,
     migration_config: Config,
+    qa_infra_context: dict,
 ) -> None:
     """IT-PS-01: real partial index, CHECKs and downgrade preserving old tables."""
     from datetime import date
@@ -80,7 +83,7 @@ async def test_it_ps_01_ledger_constraints_and_reversible_migration(
 
     async with pg_engine.begin() as connection:
         schema = await connection.scalar(text("SELECT current_schema()"))
-        assert schema.startswith("test_seo_")
+        assert schema == qa_infra_context["resource"]["schema"]
 
         def inspect_ledger(conn: Connection) -> None:
             inspector = inspect(conn)
@@ -88,7 +91,7 @@ async def test_it_ps_01_ledger_constraints_and_reversible_migration(
             index = indexes["ux_parse_dispatches_schedule"]
             assert index["unique"]
             assert index["column_names"] == ["provider", "equestrian_id", "schedule_date"]
-            assert "schedule" in index["dialect_options"]["postgresql_where"]
+            assert "schedule" in index.get("dialect_options", {})["postgresql_where"]
             checks = {c["name"] for c in inspector.get_check_constraints("parse_dispatches", schema=schema)}
             assert checks == {
                 f"ck_parse_dispatches_{name}" for name in ("trigger", "status", "attempts", "schedule_date")

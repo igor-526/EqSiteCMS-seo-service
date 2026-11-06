@@ -2,9 +2,10 @@
 
 import logging
 import os
+import sys
 from collections.abc import AsyncIterator, Iterator
+from importlib import import_module
 from pathlib import Path
-from uuid import uuid4
 
 import pytest
 from alembic import command
@@ -16,35 +17,36 @@ from sqlalchemy.pool import NullPool
 
 
 @pytest.fixture
-async def empty_pg_engine() -> AsyncIterator[AsyncEngine]:
-    raw_url = os.environ.get("TEST_DATABASE_URL")
-    if not raw_url:
-        pytest.skip("TEST_DATABASE_URL is required for dedicated PostgreSQL tests")
-    url = make_url(raw_url)
-    if url.drivername != "postgresql+asyncpg":
-        pytest.fail("TEST_DATABASE_URL must use postgresql+asyncpg")
-    schema = f"test_seo_{uuid4().hex}"
-    admin = create_async_engine(url, poolclass=NullPool, hide_parameters=True)
+def qa_infra_context(request: pytest.FixtureRequest) -> dict:
+    """Infrastructure requires the explicit shared helper AND a runner-owned permit.
+
+    Run exact node IDs through scripts/qa/infra/run.py; direct TEST_DATABASE_URL /
+    TEST_NATS_URL invocation is deliberately unsupported. No runtime fallback.
+    """
+    root = os.environ.get("QA_TEST_SUPPORT_ROOT")
+    if not root or not (Path(root) / "infra/__init__.py").is_file():
+        pytest.fail("Explicit QA_TEST_SUPPORT_ROOT with infra support is required")
+    sys.path.insert(0, str(Path(root).resolve()))
+    load_context = import_module("infra").load_context
+
+    kind = "nats" if request.node.path.name == "test_nats_broker.py" else "pg"
+    return load_context(kind)
+
+
+@pytest.fixture
+async def empty_pg_engine(qa_infra_context: dict) -> AsyncIterator[AsyncEngine]:
+    """Use the already-created exact schema; root cleanup belongs only to runner."""
+    url = make_url(qa_infra_context["url"]).set(drivername="postgresql+asyncpg")
     engine = create_async_engine(
         url,
         poolclass=NullPool,
         hide_parameters=True,
-        connect_args={"server_settings": {"search_path": f"{schema},public"}},
+        connect_args=qa_infra_context["connect_args"],
     )
-    created = False
     try:
-        async with admin.begin() as connection:
-            await connection.execute(text(f'CREATE SCHEMA "{schema}"'))
-        created = True
         yield engine
     finally:
         await engine.dispose()
-        if created and os.environ.get("TEST_KEEP_SCHEMA") != "1":
-            # schema is generated locally, never derived from caller input.
-            assert schema.startswith("test_seo_") and len(schema) == 41
-            async with admin.begin() as connection:
-                await connection.execute(text(f'DROP SCHEMA "{schema}" CASCADE'))
-        await admin.dispose()
 
 
 @pytest.fixture

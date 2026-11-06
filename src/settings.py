@@ -65,6 +65,19 @@ settings = Settings()
 
 
 class NatsSettings(BaseSettings):
+    # Отдельный setup_maintenance(); существующий parse startup не активирует runtime.
+    nats_stream_seo_maintenance: str = Field(
+        default="SEO_MAINTENANCE", alias="NATS_STREAM_SEO_MAINTENANCE", min_length=1
+    )
+    nats_stream_maintenance_results: str = Field(
+        default="METRICA_MAINTENANCE_RESULTS", alias="NATS_STREAM_MAINTENANCE_RESULTS", min_length=1
+    )
+    nats_consumer_merge_completed: str = Field(
+        default="seo-metrica-pages-merge-completed", alias="NATS_CONSUMER_MERGE_COMPLETED", min_length=1
+    )
+    nats_consumer_cleanup_completed: str = Field(
+        default="seo-metrica-cleanup-completed", alias="NATS_CONSUMER_CLEANUP_COMPLETED", min_length=1
+    )
     nats_servers_raw: str = Field(default="nats://eqsitecms-nats:4222", alias="NATS_SERVERS", min_length=1)
     nats_stream_parse_commands: str = Field(default="PARSE_COMMANDS", alias="NATS_STREAM_PARSE_COMMANDS", min_length=1)
     nats_subjects_parse_commands_raw: str = Field(
@@ -145,3 +158,22 @@ class ParseSettings(BaseSettings):
         """Вызывается DI после сборки реестра (SEO-3)."""
         if set(self.parse_providers_enabled) - set(registered_codes):
             raise ValueError("PARSE_PROVIDERS_ENABLED contains an unregistered provider")
+
+
+class NormalizationSettings(BaseSettings):
+    normalization_enabled: bool = Field(default=False, alias="SEO_NORMALIZATION_ENABLED")
+    normalization_tick_seconds: float = Field(
+        default=2, alias="SEO_NORMALIZATION_TICK_SECONDS", ge=0.1, le=60, allow_inf_nan=False
+    )
+    normalization_tenant_page_size: int = Field(default=100, alias="SEO_NORMALIZATION_TENANT_PAGE_SIZE", ge=1, le=500)
+    normalization_scan_batch_size: int = Field(default=500, alias="SEO_NORMALIZATION_SCAN_BATCH_SIZE", ge=1, le=500)
+    normalization_delete_batch_size: int = Field(
+        default=500, alias="SEO_NORMALIZATION_DELETE_BATCH_SIZE", ge=1, le=500
+    )
+    normalization_relay_batch_size: int = Field(default=100, alias="SEO_NORMALIZATION_RELAY_BATCH_SIZE", ge=1, le=500)
+    normalization_readiness_file: str = Field(
+        default=".seo-maintenance-ready", alias="SEO_NORMALIZATION_READINESS_FILE", min_length=1
+    )
+    model_config = SettingsConfigDict(
+        env_file=".env", env_file_encoding="utf-8", extra="ignore", populate_by_name=True
+    )

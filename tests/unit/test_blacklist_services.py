@@ -20,8 +20,12 @@ def case(
     repository = AsyncMock()
     repository.get_by_value.return_value = None
     if request.param == "param":
-        return BlacklistedQueryParamService(repository), repository, BlacklistedQueryParam
-    return BlacklistedHashService(repository), repository, BlacklistedHash
+        return (
+            BlacklistedQueryParamService(repository, normalization_service=AsyncMock()),
+            repository,
+            BlacklistedQueryParam,
+        )
+    return BlacklistedHashService(repository, normalization_service=AsyncMock()), repository, BlacklistedHash
 
 
 type Case = tuple[
@@ -156,7 +160,9 @@ async def test_delete_and_list_only_touch_blacklist(case: Case) -> None:
 async def test_invalid_hash_prefix(value: str) -> None:
     repository = AsyncMock()
     with pytest.raises(ClientError):
-        await BlacklistedHashService(repository).create(equestrian_id=uuid4(), data=BlacklistItemInDto(value=value))
+        await BlacklistedHashService(repository, normalization_service=AsyncMock()).create(
+            equestrian_id=uuid4(), data=BlacklistItemInDto(value=value)
+        )
     repository.create.assert_not_awaited()
 
 
@@ -165,7 +171,7 @@ async def test_hash_strips_one_prefix_and_allows_url_symbols() -> None:
     repository = AsyncMock()
     repository.get_by_value.return_value = None
     repository.create.return_value = BlacklistedHash(equestrian_id=tenant, value="!/catalog?x=1")
-    await BlacklistedHashService(repository).create(
+    await BlacklistedHashService(repository, normalization_service=AsyncMock()).create(
         equestrian_id=tenant, data=BlacklistItemInDto(value=" #!/catalog?x=1 ")
     )
     repository.get_by_value.assert_awaited_once_with("!/catalog?x=1", equestrian_id=tenant)
@@ -175,7 +181,7 @@ async def test_hash_strips_one_prefix_and_allows_url_symbols() -> None:
 async def test_param_forbids_url_symbols(value: str) -> None:
     repository = AsyncMock()
     with pytest.raises(ClientError):
-        await BlacklistedQueryParamService(repository).create(
+        await BlacklistedQueryParamService(repository, normalization_service=AsyncMock()).create(
             equestrian_id=uuid4(), data=BlacklistItemInDto(value=value)
         )
     repository.create.assert_not_awaited()

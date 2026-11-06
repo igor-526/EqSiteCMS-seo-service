@@ -22,4 +22,9 @@ class ConnectedMetricaBinding(MetricaBinding):
 
 class ConnectedMetricaCounter(BaseModel):
     model_config = ConfigDict(extra="forbid")
+    # Required private peer metadata, including when the binding is absent.
+    # SEO only preflights identity; authoritative maintenance admission stays in M.
+    binding_generation: int = Field(strict=True, ge=0)
+    cleanup_requested_seq: int = Field(strict=True, ge=0)
+    cleanup_completed_seq: int = Field(strict=True, ge=0)
     counter: ConnectedMetricaBinding | None

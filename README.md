@@ -377,3 +377,460 @@ make asyncapi-validate-parse
 stream/subjects и обязательный cleanup, проверяет FILE/LIMITS/max_age,
 идемпотентный add_stream, публикацию и duplicate; consumer broker gate отдельно
 проверяет durable/filter/ack/nak/redelivery/max_deliver/term в ya-metrica-service.
+
+### Additive normalization storage (106–107, runtime OFF)
+
+Alembic head `20261102_0004` (parent `20261028_0003`) adds a sequence-backed
+`pages.scan_seq`, unique global sequence index and `(equestrian_id, scan_seq)`
+keyset index. Existing pages receive values from `nextval` during migration:
+apply only in the agreed maintenance window with admissions stopped. There is
+no historical URL rewrite or statistics mutation in this migration.
+
+New tables: `normalization_tenants`, `normalization_revisions`,
+`normalization_snapshots`, `normalization_scans`, `normalization_mappings`,
+`normalization_redirects`, `normalization_inbox`, `normalization_outbox`.
+Snapshots retain both rule lists; mappings/UUID redirects deliberately do not
+reference physical pages (they must survive source deletion). Revision links
+are tenant-qualified. A partial unique index allows at most one non-pending,
+non-finalized revision per tenant; blocked revisions retain this barrier.
+
+This schema alone does **not** enable producers, scans or consumers. Storage
+repositories enforce tenant membership/cycle checks and oldest-revision
+activation; callers must lock before page inserts. S-1c adds atomic effect/checkpoint/
+lease CAS below. Database CHECK/UNIQUE constraints are not
+substitutes for those guards. Domain contracts live in
+`core/entities/normalization.py` and
+`core/protocols/repositories/normalization_repository.py`.
+
+Rollback: disable new producers/workers and retain additive schema. Downgrade
+refuses **any** nonempty normalization table, including early inbox results,
+so active mappings, redirect chains, barriers and delivery intents cannot be
+silently lost. Empty-schema downgrade removes only the additive storage and
+scan sequence/column/indexes; existing page UUIDs/paths remain. After the first
+merge/delete, use a coordinated backup restore or forward-fix, never discard
+ledgers or restart old parsing over unfinished operations.
+
+Schema PostgreSQL checks (require explicit `TEST_DATABASE_URL`, isolated test
+schema): `uv run pytest tests/integration/test_normalization_schema_postgres.py
+ tests/integration/test_migrations_postgres.py -m infrastructure`. Missing URL
+means not verified, not acceptance; no runtime database is chosen implicitly.
+
+
+### Репозитории нормализации S-1b (runtime OFF)
+
+`repositories.normalization_repository.NormalizationRepository(session)` работает
+только в **транзакции вызывающего кода**, без commit/rollback и отдельной сессии.
+`lock_tenant(equestrian_id=...)` создаёт lock-row идемпотентно и берёт row lock до
+конца транзакции. `create_revision` / `activate_next` / `store_mappings` /
+`resolve_redirect` берут этот же lock сами. Для rule POST caller сначала берёт
+lock, меняет правило, затем вызывает `create_revision` с полным снимком **обоих**
+списков в той же транзакции. Page resolve обязан взять lock **до чтения правил и
+INSERT страницы / выделения scan_seq**. Текущий PageRepository/runtime пока не
+переключён: это интеграция S-2, не разрешение включать scan.
+
+- `create_revision`: монотонный tenant revision, immutable snapshot и pending
+  scan вместе; дубликат operation — ошибка, не замена снимка. При rollback
+  откатываются номер и все строки. Duplicate rule POST caller отсекает до этого.
+- `activate_next`: только oldest unfinished и только pending; любой активный,
+  включая blocked, удерживает барьер. High-water `max(scan_seq)` своей конюшни
+  фиксируется при **активации**, не при enqueue; пустая конюшня получает 0.
+- `get_revision` / `get_checkpoint`: строго tenant + operation. Неизвестная
+  ревизия даёт None, неизвестный checkpoint — безопасную ValueError.
+- `scan_pages`: `cursor < scan_seq <= high_water`, сортировка по scan_seq,
+  limit 1..500, без OFFSET. Pending scan без high-water не читается. Caller
+  продвигает cursor, а на последней/пустой выборке доводит его до high-water;
+  отсутствующие sequence значения не означают незавершённость scan.
+- `store_mappings`: 1..500 элементов, все source/target — live pages своей
+  конюшни; source_scan_seq сверяется с реальной страницей и high-water.
+  Источники уникальны внутри batch и revision, точный повтор идемпотентен,
+  конфликт target/seq/part_index отклоняется. Target обязан быть терминальным
+  (не source в batch и не существующий alias), что запрещает цепь/цикл нового
+  batch. Mapping+redirect записываются **после всех проверок**, без N+1:
+  два lock SQL + пять bounded чтений + два bulk INSERT независимо от размера
+  batch; membership/alias запросы содержат не более 1000 UUID.
+- `get_mappings`: tenant/operation keyset `source_scan_seq > after_seq`,
+  limit 1..500. Подходит для последующих bounded delete, но сам ничего не удаляет.
+- `resolve_redirect`: tenant-scoped chain, максимум 64 перехода; цикл, слишком
+  длинная цепь или отсутствие живой терминальной страницы дают ValueError без
+  частичной compression. Успешная цепь сжимается под tenant lock. Старые aliases
+  разрешаются после physical source deletion; FK на pages намеренно отсутствует.
+  Превышение лимита — fail closed, не возврат устаревшего source UUID.
+
+`store_mappings` — **не worker entrypoint**: он не проверяет lease, не двигает
+checkpoint и не пишет outbox. Worker использует `commit_scan_batch`: lease/checkpoint
+CAS, mappings/redirects/outbox/checkpoint внутри savepoint общей caller transaction.
+Прямое использование `store_mappings` требует caller fencing/rollback. После seal запись mappings запрещена;
+awaiting_cleanup допускается лишь пока scan не sealed. Никакие ранние cleanup
+results сами по себе не разрешают удаление SEO sources.
+
+Репозиторные PG fixtures: `uv run pytest -m infrastructure
+ tests/integration/test_normalization_repository_postgres.py`. Покрывают >2
+keyset/mapping batch, snapshot/revision queue, late insert/high-water, tenant
+isolation, идемпотентность/конфликты, cycle/compression/deleted alias, caller
+rollback и lock races. Это **fixtures, не evidence успешного PG acceptance**
+при отсутствующем TEST_DATABASE_URL; delivery/checkpoint fixtures описаны ниже,
+полный IT-N-01 и cross-service acceptance остаются S-3/QG.
+
+
+### Delivery/checkpoint storage S-1c (runtime OFF)
+
+Новых HTTP endpoints, NATS consumers или scheduler wiring нет. Head/schema не
+менялись; все primitives используют переданный `AsyncSession`, без outer
+commit/rollback. SQL/driver ошибки санитизируются, payload/credentials не логируются.
+
+- `claim_scan(equestrian_id, operation_id, now, duration) -> StorageLease | None`:
+  короткий tenant lock, только scanning/awaiting_cleanup/deleting с high-water;
+  свободная/истёкшая lease заменяется новым UUID token, attempts увеличивается.
+  Claim нужно **commit до внешнего I/O**, не держать транзакцию на HTTP/NATS.
+  Эта lease принадлежит operation; разрешение physical delete и correlation
+  completed/finalized реализует S-3, не claim. Сам claim никогда ничего не удаляет.
+- `commit_scan_batch(... lease, expected, checkpoint, mappings, messages, now)`:
+  tenant lock → savepoint → token/until/attempts/full checkpoint CAS под row lock
+  → membership/cycle-checked `store_mappings` → outbox → checkpoint. UTC-aware
+  clock обязателен; expiry проверяется и по `now`, и по реальному PostgreSQL
+  `clock_timestamp()` **до и после эффектов**. Lease loss/conflict откатывает
+  savepoint целиком даже если caller поймал ValueError. Outer commit остаётся
+  ответственностью caller. Не оставлять ORM pending changes перед begin_nested
+  (SQLAlchemy может flush их до savepoint).
+- Batch: максимум 500 mappings, один part при непустом mapping batch, part_index
+  равен expected.next_part_index, новый next_part_index увеличивается на 1.
+  Все sources лежат в `(expected.cursor, checkpoint.cursor]`, watermark неизменен,
+  delete_cursor scan-метод не меняет. No-op/unchanged страницы двигают cursor без
+  part. Seal требует cursor==high_water и одно terminal message (part_index=None);
+  рекомендован отдельный пустой seal batch. Каждый успешный batch **освобождает
+  lease**; следующий batch заново claim в новой транзакции. Старый checkpoint/token
+  не принимается. С S-2b seal также атомарно сохраняет revision.part_count и
+  awaiting_result (либо сохраняет awaiting_cleanup) внутри того же savepoint и
+  final clock fence. Это НЕ finalized и НЕ разрешение удаления source.
+- `enqueue_outbox(message)`: tenant operation обязана существовать; точный retry
+  no-op, конфликт message_id либо `(tenant,operation,kind,part_index-or-terminal)`
+  даёт ValueError, не overwrite. `MaintenanceMessage.payload_hash` — SHA-256
+  канонического `json.dumps(payload, sort_keys=True, separators=(",", ":"),
+  allow_nan=False)` (default ensure_ascii=True), как в metrica storage. JSON object
+  и canonical body ≤256 KiB; schema/UUID-only/correlation валидирует transport/S-3.
+- `claim_outbox(equestrian_id, now, duration, limit=100)` (1..500) возвращает
+  `Sequence[OutboxClaim(message, lease)]`: ready unpublished rows, tenant-scoped
+  `FOR UPDATE SKIP LOCKED`, новый token/attempts. Commit → publish вне транзакции
+  → `finish_outbox(claim, now, published=True)` **только после PubAck** → commit.
+  False от finish означает stale/expired claim: опубликованный payload может
+  прийти повторно, это нормально. При ошибке `published=False, retry_after=1..60s`
+  оставляет намерение без cap/purge, очищает lease и ставит next_attempt_at.
+- `accept_inbox(consumer, message)` возвращает True только на новую durable запись;
+  exact identity/hash/content retry — False независимо от broker window, foreign
+  tenant/operation или другой hash с тем же `(consumer,message_id)` — ValueError.
+  Unknown early cleanup result разрешено сохранить **без revision FK**, но это
+  НЕ разрешение SEO delete. False НЕ означает processed: потерянный ACK либо ранний
+  result требует replay/correlation. `mark_inbox_processed(consumer,message,now)`
+  вызывается вместе с business effects в outer transaction; ACK лишь после commit.
+
+PG fixtures: `uv run pytest -m infrastructure
+ tests/integration/test_normalization_delivery_postgres.py` — migration-backed
+atomic rollback/restart, >2 bounded batches/seal, lease/checkpoint fencing,
+конкурентные claims/inbox, lost PubAck/reclaim и outbox conflict rollback.
+Без TEST_DATABASE_URL это **не PG acceptance**. Runtime остаётся OFF; полный suite
+и результат/cleanup/delete/finalized integration относятся к S-3/QG. Rollback
+по-прежнему оставляет additive schema и все ledger/outbox/inbox: не сбрасывать
+leases/барьеры вручную и не downgrade непустые таблицы.
+
+### Request-side normalization (106–107, S-2a; worker runtime OFF)
+
+`NormalizationService` — обязательная зависимость page/blacklist services; DI
+создаёт все участвующие repositories с одной context-local request session.
+`TenantTransactionalRoute` владеет outer transaction: commit до ответа, rollback
+при любой ошибке. Сервисы не коммитят и не обращаются к брокеру.
+
+- POST обоих списков валидирует значение, берёт общий tenant lock **до** duplicate
+  lookup/insert, сохраняет правило, отсортированный snapshot обоих списков,
+  монотонную pending revision и scan row в одной транзакции. Эти строки — durable
+  scan intention, не синхронный обход pages. Duplicate/invalid POST не планирует
+  работу; ошибка последующего snapshot/revision откатывает весь запрос.
+- Resolve берёт тот же lock **до** чтения текущих правил и выделения `scan_seq`.
+  Используется прежний `PageNormalizer`, затем обычный page resolve и перевод UUID
+  по действующим tenant-scoped redirects. Поле `normalized` остаётся результатом
+  текущих настроек; aliases переводят UUID, а не навсегда переписывают URL.
+- PATCH/DELETE тоже сериализуются lock, но **не создают** revision/scan и не меняют
+  уже сохранённый snapshot. Будущий resolve видит новые настройки. Уже слитые
+  варианты/распределения не восстанавливаются; после удаления правила допустим
+  новый UUID ранее разрешённого варианта, но не воскрешение удалённого UUID.
+- POST не активирует revision: `activate_next` будущего worker фиксирует high-water
+  под тем же lock только для oldest pending после finalized предшественника.
+  Нельзя обрабатывать следующую revision при blocked/awaiting_result/cleanup.
+
+HTTP DTO/status/selector policy не менялись: seo peer routes — Internal Trusted
+Network exceptions из matrix выше, Cookie/Bearer не заменяет tenant selector;
+Protected Write gateway остаётся строго SEO (105), без ADMIN override.
+
+S-2a не запускает stack/scan scheduler/transport, не удаляет source pages и не
+снимает parse gates. Bounded scan, chunk/seal orchestration описаны ниже (S-2b);
+consumer correlation, safe delete и finalized — S-3.
+
+Request tests: `uv run pytest tests/unit/test_normalization_service.py
+ tests/unit/test_blacklist_services.py tests/api/test_blacklist_api.py
+ tests/api/test_resolve_api.py -m "not infrastructure"`.
+`tests/integration/test_normalization_service_postgres.py` содержит migration-backed
+IT-N-01 fixtures для atomic rollback/duplicate и обоих порядков POST↔resolve,
+activation watermark/queued snapshot/tenant isolation. Без `TEST_DATABASE_URL`
+они не выполнялись; collection/skips **не** являются PG acceptance.
+
+
+### Bounded scan orchestration (106–107, S-2b; runtime OFF)
+
+`ServicesContainer.normalization_scan_service()` создаёт
+`NormalizationScanService(normalization_repository, page_repository, page_normalizer,
+batch_size=500, max_body_bytes=262144)` с той же caller-owned session.
+Ни lifespan, ни scheduler/worker/transport этим unit не подключены.
+
+- `run_batch(equestrian_id, now, duration=30s) -> (operation_id, ScanCheckpoint) | None`
+  выполняет **ровно одну** ограниченную транзакционную единицу. Caller открывает
+  transaction, вызывает метод и commit; при **любой** ошибке — полный rollback,
+  включая canonical targets, созданные до storage savepoint. Не ловить ошибку
+  lease с последующим commit. Между вызовами — новая TX и новый claim; никаких
+  HTTP/NATS calls под tenant lock. Работа с миллионом страниц — повторные вызовы,
+  не цикл в одной транзакции и не загрузка всех mappings.
+- Под tenant lock `get_active_revision` читает oldest unfinished. Pending
+  активируется через `activate_next`, high-water фиксируется один раз. Scanning
+  и unsealed awaiting_cleanup возобновляются с durable cursor; leased возвращает
+  None. Awaiting_result, sealed awaiting_cleanup, deleting и blocked блокируют
+  последующие revisions **до finalized**, включая пустую/no-op revision.
+  None означает idle/wait/lease, а не успешную финализацию или разрешение parse.
+- Keyset `(cursor, high_water]`, максимум 500 страниц: неизменяемый snapshot
+  обоих списков и существующий PageNormalizer. Изменённый путь использует обычный
+  PageRepository.resolve (find-or-create), затем terminal UUID через redirects;
+  bounded cache target paths живёт только один batch. Новые targets/resolve
+  после watermark не расширяют scan. Unchanged и source==terminal target не
+  создают mapping. Sequence gaps продвигают cursor до high-water после короткого
+  последнего/пустого batch.
+- Один непустой mapping batch → один part, максимум 500 пар и 256 KiB полного
+  canonical JSON body; на меньшем bytes limit часть заканчивается раньше, cursor
+  не перескакивает первую не записанную source. Все URLs остаются в SEO, в outbox
+  только UUID. Message ID: uuid5(NAMESPACE_URL,
+  `eqcms:maintenance:v1:commands.seo.pages.merge:<operation>:<part_index-or-seal>`).
+  Envelope v1 с UTC occurred_at, normalization_revision и kind=mappings/seal;
+  hash — SHA-256 canonical JSON. Relay S-3 передаёт сохранённое тело/ID **без
+  пересоздания timestamp**, публикует на `commands.seo.pages.merge` с этим
+  Nats-Msg-Id и отмечает published только после PubAck.
+- `commit_scan_batch` атомарно сохраняет mappings+aliases+outbox+checkpoint,
+  проверяет lease/CAS/реальный DB clock до и после эффектов и освобождает lease.
+  Следующий вызов после cursor==high_water — отдельный seal-only batch, part_count
+  из durable next_part_index. Даже empty/no-op отправляет seal(0) и ждёт результат
+  S-3, без shortcut finalized. Seal+revision status/part_count теперь входят в тот
+  же savepoint: awaiting_result либо сохранённое awaiting_cleanup с correlation.
+  Рестарт после committed seal не создаёт его снова и не активирует следующую
+  revision. Очередная revision после finalized получает новый watermark.
+- Cleanup supersession НЕ останавливает ограниченный SEO scan/aliases и НЕ
+  разрешает удаление источников. S-3 должен дождаться одновременно seal и
+  correlated cleanup.completed, безопасно удалить только mapped source UUID,
+  сохранить finalized+outbox и лишь затем разрешить следующую revision. Метрика
+  удерживает awaiting_seo до correlated finalized. В этом unit source не удаляются.
+
+Targeted: `uv run pytest tests -k "normaliz or merge or page" -m "not infrastructure"`.
+`tests/integration/test_normalization_scan_postgres.py` содержит migration-backed
+fixtures для >2 batches, existing/new targets, watermark/restart, stale fence
+rollback, seal atomic rollback, queued revisions, concurrent workers/foreign tenant
+и durable lease/reclaim. Без TEST_DATABASE_URL выполнена только collection,
+**не PostgreSQL acceptance**; full suite и transport runtime остаются S-3.
+
+### Maintenance transport foundation (S-3a, runtime OFF)
+
+| Stream / owner | Subject | Durable | Роль SEO |
+|---|---|---|---|
+| SEO_MAINTENANCE / seo-service | commands.seo.pages.merge | ya-metrica-pages-merge | исходящий mappings/seal |
+| SEO_MAINTENANCE / seo-service | events.seo.pages.merge.finalized | ya-metrica-pages-merge-finalized | исходящий finalized |
+| METRICA_MAINTENANCE_RESULTS / ya-metrica-service | events.metrica.pages.merge.completed | seo-metrica-pages-merge-completed | входящий result |
+| METRICA_MAINTENANCE_RESULTS / ya-metrica-service | events.metrica.cleanup.completed | seo-metrica-cleanup-completed | входящий cleanup |
+
+`NatsJetstreamClient.setup_maintenance()` — отдельный opt-in setup, НЕ вызывается
+API, parse scheduler или lifespan. Создаёт только SEO_MAINTENANCE (FILE/LIMITS,
+без expiry); регистрирует два pull/ALL/explicit ack=30s/max_deliver=-1 durable на
+чужом results stream. Только NotFound повторяется (10 попыток, линейный шаг 2s);
+несовместимый config падает сразу. Существующий PARSE_COMMANDS не меняется.
+Настройки stream/durable — `NATS_STREAM_SEO_MAINTENANCE`,
+`NATS_STREAM_MAINTENANCE_RESULTS`, `NATS_CONSUMER_MERGE_COMPLETED`,
+`NATS_CONSUMER_CLEANUP_COMPLETED`. Изменение имён требует согласованной topology.
+
+`MaintenancePublisher` публикует сохранённый `MaintenanceMessage.payload_json`
+как bytes и прежний `message_id` (Nats-Msg-Id); проверяет UUID-only schema,
+canonical hash, tenant/operation и детерминированный ID. Timestamp/envelope не
+пересоздаются. `finalized` suffix: `finalized:<result_message_id>`.
+PubAck.duplicate логируется warning и считается доставленным повтором.
+
+`NormalizationOutboxRelay(transaction=..., publisher=..., clock=..., batch_size=100,
+lease_duration=30s).run_batch(equestrian_id=...) -> int` возвращает число успешно
+отмеченных доставок. `transaction()` обязан выдавать repository одной session,
+commit при успешном выходе и rollback при ошибке. Claim фиксируется отдельной TX,
+publish выполняется без открытой TX, finish — новой короткой TX. Retry 1..60s без
+cap, с безопасной эскалацией после 5 попыток; claim expiry/CAS не позволяет
+устаревшему relay отметить delivery. Ошибка mark/commit или отмена процесса
+оставляет durable claim: после expiry повторяются тот же body/ID, включая потерю
+PubAck и crash между PubAck и mark. Не удалять outbox/ledger ради recovery.
+
+DI использует factory `clients_container.maintenance_publisher()`;
+relay transaction adapter, tenant enumeration, result handlers, scan/delete
+runner и supervision/readiness подключены отдельным opt-in process (см. ниже). Созданный durable
+сам по себе НЕ readiness и НЕ доказательство consumer startup. Empty scan
+обязательно публикует seal(0), ждёт result и finalized; relay не снимает barrier.
+До реальных PostgreSQL/JetStream gates runtime не включать; mocks/collection не
+заменяют acceptance. Broker storage loss требует операторского replay ledger,
+не сброса барьеров. Новых HTTP endpoints/ролей нет.
+
+### Результаты и финализация нормализации (S-3b, runtime OFF)
+
+`NormalizationFinalizationService(repository, batch_size=500)` не запускается
+из API/parse scheduler. Runtime adapter, subscriptions, tenant dispatcher и
+supervision остаются отдельным S-3c; до реальных PG/NATS gates runtime выключен.
+Новых HTTP endpoints и изменений peer access policy нет.
+
+- `accept_result(message=MaintenanceMessage, now=UTC) -> bool`: виды
+  `merge_completed` / `cleanup_completed`; строгие UUID-only DTO, canonical
+  SHA-256 JSON, версия/UTC/tenant/operation/revision/полнота проверяются до
+  разрешения удаления. Caller начинает TX, **commit до ACK**, rollback при
+  ошибке. `False` означает точный duplicate, **не** processed. ValueError —
+  безопасная permanent validation/correlation ошибка; временные storage ошибки
+  требуют retry/nak. Не логировать payload или текст driver/Pydantic exception.
+- Inbox сохраняет ранние cleanup и merge reports независимо от redelivery.
+  `get_inbox_result(consumer, equestrian_id, operation_id)` читает также processed
+  cleanup ledger; поиск ограничен двумя строками для обнаружения конфликта.
+  Другой message ID/hash для уже принятого результата операции — conflict,
+  а не перезапись разрешения. Неизвестный/чужой merge не принимается.
+- Superseded report переводит ревизию в `awaiting_cleanup`, не останавливая
+  неоконченный bounded scan/aliases. **Оба** барьера обязательны: scan sealed и
+  cleanup.completed с теми же tenant, cleanup operation ID и seq. Ранний
+  completed также сохраняется, но не разрешает delete до seal/точного part_count.
+- `run_batch(equestrian_id, now, duration=30s) -> (operation_id, checkpoint) | None`:
+  одна caller TX и максимум 500 durable mappings. `None` — ожидание/idle/lease,
+  не finalized. На ошибке обязательно rollback всей caller TX; перед SAVEPOINT
+  не оставлять ORM pending changes. Claim допускает `awaiting_result`,
+  `awaiting_cleanup`, `deleting`; storage повторно проверяет все барьеры.
+- `commit_delete_batch` удаляет только source UUID своего tenant по mapping
+  keyset `source_scan_seq > delete_cursor`; targets, UUID redirects и ledger
+  сохраняются. Эффект/checkpoint/release lease атомарны; token, attempts,
+  expected checkpoint и expiry проверяются до эффекта и DB clock — после.
+  После полного батча нужен следующий (возможно пустой) batch для завершения.
+  После crash сервис продолжает durable delete cursor, без повторного эффекта.
+- Последний batch атомарно сохраняет `finalized`, processed marker merge result
+  и outbox с `result_message_id`. UUID5 suffix `finalized:<result_message_id>`;
+  relay отправляет сохранённый body/ID. Empty revision тоже проходит seal(0),
+  correlated result и этот путь финализации. Следующий scan активируется только
+  после finalized, в новой TX с актуальным high-water; до доставки finalized
+  Метрика продолжает удерживать свой parse gate.
+
+Scoped fixtures: `tests/unit/test_normalization_finalization_service.py` и
+`tests/integration/test_normalization_finalization_postgres.py` (IT-N-01).
+Collection/skip без `TEST_DATABASE_URL` не является PG acceptance; без
+`TEST_NATS_URL` реальный broker gate также остаётся OPEN.
+
+### Адаптер результатов maintenance (S-3c, runtime по-прежнему OFF)
+
+`repositories.normalization_transaction.NormalizationTransaction(SessionFactory)`
+предоставляет новый `AsyncSession` и короткую `session.begin()` на каждый вызов;
+commit выполняется при успешном выходе, ошибки и cancellation откатывают TX.
+Эта фабрика совместима с `NormalizationOutboxRelay`: публикация остаётся **вне** TX.
+
+`clients.nats.maintenance_results.MaintenanceResultHandler` переводит только два
+result subject в строгий DTO и сохранённый `MaintenanceMessage` (исходное тело,
+SHA-256 canonical JSON). Он вызывает `accept_result` и возвращается только после
+commit inbox. `MaintenanceResultConsumer.process()` выполняет ACK после commit,
+включая exact redelivery; invalid schema/tenant/correlation → TERM, временный
+storage/commit failure → NAK с backoff 1..60s и безопасной эскалацией с 5-й ошибки.
+Cancellation не подтверждает сообщение. Payload, headers и текст исключения не
+попадают в diagnostics. Батчи scan/delete в обработчике не выполняются.
+
+`MaintenanceResultConsumer.run()` привязывает существующий durable, fetch по одному
+сообщению; fetch/ACK failures выходят к process supervisor, а не скрываются в
+отсоединённой задаче. При остановке локальная подписка закрывается без удаления
+durable/stream. Ни импорт модуля, ни HTTP/parse scheduler не запускают consumer.
+
+**Service runtime подключён в S-3c2b:** отдельный DI/process, startup
+retry/supervision/readiness и opt-in Compose описаны ниже; rollout остаётся OFF.
+До реальных gates запускать consumer/relay в рабочем стеке нельзя. Настройка
+включения default OFF, auto-start API/scheduler не добавлен. PG/NATS gates OPEN;
+unit/mocked tests и collection PostgreSQL fixtures их не закрывают. Полный unit
+suite выполнен S-3c2b; результат и оставшиеся infra gates — в change tasks.md.
+
+### Bounded tenant dispatch (S-3c2a, runtime OFF)
+
+`NormalizationRepository.list_work_tenants(now, after=None, limit=100)` возвращает
+не более 1..500 tenant UUID в порядке UUID, без OFFSET/tenant locks. Объединяются
+незавершённые revisions (включая blocked/waiting) и **due unpublished outbox**, у
+которого нет живой lease. Поэтому finalized revision с ещё не доставленным
+финальным событием не исчезает из dispatch. Каждая distinct ветка и общий результат
+ограничены limit; одна ревизия/конюшня с множеством сообщений не заполняет страницу
+дубликатами. Discovery — hint, не claim; проверки состояния/tenant и fencing
+повторно выполняются существующими batch services/relay.
+
+`NormalizationDispatcher.tick() -> int` обрабатывает одну страницу tenants, по
+одному scan, finalization и relay batch для каждого tenant; возвращает количество
+ошибок стадий. Discovery/commit failure выходит к process supervisor, stage error
+изолирован и логируется без exception text/payload. Supervisor обязан учитывать
+ненулевой результат для health/backoff, а не выдавать успешную readiness. Cancellation
+распространяется немедленно. Short/empty page сбрасывает UUID cursor; полный page
+продолжается в следующем tick, без бесконечного обхода внутри одного tick. После
+restart cursor начинается с начала, но scan/delete/revision checkpoints остаются
+в БД. Новые меньшие UUID подхватываются на следующем проходе.
+
+`depends.normalization_runtime.NormalizationBatchTransactions(SessionFactory,
+normalizer=..., scan_batch_size=500, delete_batch_size=500)` предоставляет `scan()`
+и `finalization()` async contexts. Каждый контекст создаёт отдельные session/begin;
+page и normalization repositories внутри scan используют одну сессию. Commit/rollback
+заканчивается **до** следующей стадии и до network relay. HTTP ContextLocalResource
+не используется. Scan successor запускается только в следующей TX после финализации
+предшественника; переноса checkpoint в память dispatcher нет.
+
+Эти фабрики подключены `build_runtime` отдельного process (S-3c2b, см. ниже).
+Parse scheduler/lifespan не изменены; Compose opt-in, readiness локальная.
+Новые fixtures: `tests/unit/test_normalization_dispatcher.py`,
+`tests/unit/test_normalization_batch_transactions.py`,
+`tests/integration/test_normalization_dispatcher_postgres.py`. Последний проверяет
+реальную SQL discovery/restart на выделенной PostgreSQL; его collection не acceptance,
+а mocked relay в нём не является real NATS gate.
+
+### Отдельный normalization process (код подключён, rollout OFF)
+
+`PYTHONPATH=src uv run python -m maintenance.main` — отдельный процесс, не HTTP
+lifespan и не parse scheduler. По умолчанию завершается без network/DB startup:
+нужен `SEO_NORMALIZATION_ENABLED=true`. Compose дополнительно требует явный
+профиль `seo-maintenance`; обычный `compose up` его не запускает. Один экземпляр
+`seo-maintenance`, не добавлять второй запуск в API/scheduler. **Не включать в
+рабочем стеке до реальных PostgreSQL/JetStream gates**: unit/mock/collection не
+являются acceptance. Новых HTTP endpoints нет; `/health` не readiness worker.
+
+| Переменная | Default | Границы / назначение |
+|---|---|---|
+| `SEO_NORMALIZATION_ENABLED` | false | явное разрешение отдельного process |
+| `SEO_NORMALIZATION_TICK_SECONDS` | 2 | 0.1..60 s между bounded ticks |
+| `SEO_NORMALIZATION_TENANT_PAGE_SIZE` | 100 | 1..500 tenants/tick, UUID keyset |
+| `SEO_NORMALIZATION_SCAN_BATCH_SIZE` | 500 | 1..500 pages/scan TX |
+| `SEO_NORMALIZATION_DELETE_BATCH_SIZE` | 500 | 1..500 source pages/delete TX |
+| `SEO_NORMALIZATION_RELAY_BATCH_SIZE` | 100 | 1..500 claimed messages/tenant |
+| `SEO_NORMALIZATION_READINESS_FILE` | .seo-maintenance-ready | локальный writable heartbeat, не shared volume |
+
+Фабрика `depends.normalization_runtime.build_runtime` собирает prepared dispatcher,
+relay, два result consumers и fresh session TX; никакой request session/container
+в app.state не требуется. Startup создаёт только отсутствующий свой SEO_MAINTENANCE
+(FILE/LIMITS, max_age=0, max_msgs/max_bytes=-1, discard=new, duplicate_window=120s)
+и отсутствующие durables на чужом results stream. До consumers выполняется stream_info
+обоих streams: точные subjects и полный canonical config владельца; чужой stream
+не создаётся/не исправляется. Existing durable проверяется как pull/ALL/explicit/30s/-1
+с точным filter, без backoff/push/headers-only; silent update запрещён.
+NotFound и transient network/503: lookup retry `NATS_SETUP_MAX_ATTEMPTS` × линейный
+`NATS_SETUP_BACKOFF_SECONDS`. `MaintenanceTopologyError` (BadRequestError) — fail-fast
+существующего supervisor; несовместимый ресурс исправляется только отдельным решением оператора;
+временные setup/worker ошибки — общий restart с backoff 1..60s и безопасным логом.
+Неисправный consumer не остаётся detached: sibling tasks отменяются, subscriptions
+закрываются, NATS закрывается, epoch создаётся заново. SIGINT/SIGTERM отменяет
+workers, сбрасывает readiness, закрывает NATS и database pool.
+
+`PYTHONPATH=src uv run python -m maintenance.readiness` — локальная probe (exit
+0/1), не новый endpoint. Требует свежий heartbeat <5s: соединение, **две реально
+bound subscriptions**, живые задачи и успешный dispatcher tick. Failed batch,
+consumer DB retry, disconnect/exit/startup/shutdown => not ready. Heartbeat
+обновляется раз в секунду; зависший процесс не сохраняет readiness. Долгий первый
+tick держит readiness false. Broker restart/fetch failure пересоздаёт обе подписки;
+committed scan/delete checkpoints, inbox и outbox остаются в PostgreSQL. Повтор
+после PubAck/ACK потери использует saved body/Msg-ID и ledger, не окно dedup.
+
+После сбоя повторный запуск возвращается к ledger: discovery cursor может
+начаться сначала, но scan/delete эффекты и checkpoint атомарны, outbox claim
+возобновляется после lease expiry. Не удалять retained stream/ledger/redirects
+для «восстановления». Потеря broker storage требует операторского replay из
+producer ledger и повторного acceptance; не снимать барьеры вручную.

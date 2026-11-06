@@ -14,6 +14,8 @@ from core.services.metrics_table.builder import MetricsTableBuilder
 from core.services.metrics_table.header_formatter import PeriodHeaderFormatter
 from core.services.metrics_table.registry import MetricRegistry
 from core.services.metrics_table.value_formatter import MetricValueFormatter
+from core.services.normalization_scan_service import NormalizationScanService
+from core.services.normalization_service import NormalizationService
 from core.services.parsing import EnvTimezoneProvider, ParseDispatchService, SlotCalculator
 
 
@@ -61,8 +63,21 @@ class ServicesContainer(containers.DeclarativeContainer):
         search_query_repository=repositories_container.search_query_repository,
         search_query_normalizer=search_query_normalizer,
     )
+    normalization_scan_service = providers.Factory(
+        NormalizationScanService,
+        normalization_repository=repositories_container.normalization_repository,
+        page_repository=repositories_container.page_repository,
+        page_normalizer=page_normalizer,
+    )
+    normalization_service = providers.Factory(
+        NormalizationService,
+        normalization_repository=repositories_container.normalization_repository,
+        blacklisted_query_param_repository=repositories_container.blacklisted_query_param_repository,
+        blacklisted_hash_repository=repositories_container.blacklisted_hash_repository,
+    )
     page_service = providers.Factory(
         PageService,
+        normalization_service=normalization_service,
         page_repository=repositories_container.page_repository,
         page_normalizer=page_normalizer,
         blacklisted_query_param_repository=repositories_container.blacklisted_query_param_repository,
@@ -70,9 +85,11 @@ class ServicesContainer(containers.DeclarativeContainer):
     )
     blacklisted_query_param_service = providers.Factory(
         BlacklistedQueryParamService,
+        normalization_service=normalization_service,
         blacklisted_query_param_repository=repositories_container.blacklisted_query_param_repository,
     )
     blacklisted_hash_service = providers.Factory(
         BlacklistedHashService,
+        normalization_service=normalization_service,
         blacklisted_hash_repository=repositories_container.blacklisted_hash_repository,
     )

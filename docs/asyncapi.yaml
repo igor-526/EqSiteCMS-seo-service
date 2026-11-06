@@ -1,7 +1,7 @@
 asyncapi: 2.6.0
 info:
-  title: EqSiteCMS SEO Parse Commands
-  version: 1.0.0
+  title: EqSiteCMS SEO Parse and Maintenance
+  version: 1.1.0
   description: >-
     Исходящие команды seo-service (API и scheduler). Доступ — доверенная внутренняя сеть без NATS auth;
     production требует отдельно подтверждённой сетевой изоляции. Секреты не передаются.
@@ -34,6 +34,104 @@ channels:
         Durable создаёт ya-metrica-service, не producer.
       message:
         $ref: '#/components/messages/ParseCommand'
+  commands.seo.pages.merge:
+    x-stream: SEO_MAINTENANCE
+    x-owner: seo-service
+    x-consumers:
+    - service: ya-metrica-service
+      durable: ya-metrica-pages-merge
+      filter_subject: commands.seo.pages.merge
+      mode: pull
+      deliver_policy: all
+      ack_policy: explicit
+      ack_wait_seconds: 30
+      max_deliver: -1
+    publish:
+      operationId: publishMergeCommand
+      description: Сохранённый outbox body/Msg-Id; publish вне TX, mark только после
+        PubAck. Retry 1..60s без cap; duplicate warning. Runtime OFF до PG/NATS acceptance.
+      message:
+        $ref: '#/components/messages/MergeCommand'
+    x-stream-config:
+      owner: seo-service
+      subjects:
+      - commands.seo.pages.merge
+      - events.seo.pages.merge.finalized
+      storage: file
+      retention: limits
+      max_age_seconds: 0
+  events.seo.pages.merge.finalized:
+    x-stream: SEO_MAINTENANCE
+    x-owner: seo-service
+    x-consumers:
+    - service: ya-metrica-service
+      durable: ya-metrica-pages-merge-finalized
+      filter_subject: events.seo.pages.merge.finalized
+      mode: pull
+      deliver_policy: all
+      ack_policy: explicit
+      ack_wait_seconds: 30
+      max_deliver: -1
+    publish:
+      operationId: publishMergeFinalized
+      description: Сохранённый outbox body/Msg-Id; publish вне TX, mark только после
+        PubAck. Retry 1..60s без cap; duplicate warning. Runtime OFF до PG/NATS acceptance.
+      message:
+        $ref: '#/components/messages/MergeFinalized'
+    x-stream-config:
+      owner: seo-service
+      subjects:
+      - commands.seo.pages.merge
+      - events.seo.pages.merge.finalized
+      storage: file
+      retention: limits
+      max_age_seconds: 0
+  events.metrica.cleanup.completed:
+    x-stream: METRICA_MAINTENANCE_RESULTS
+    x-owner: ya-metrica-service
+    x-consumers:
+    - service: yandex-service
+      durable: yandex-metrica-cleanup-completed
+      filter_subject: events.metrica.cleanup.completed
+      mode: pull
+      deliver_policy: all
+      ack_policy: explicit
+      ack_wait_seconds: 30
+      max_deliver: -1
+    - service: seo-service
+      durable: seo-metrica-cleanup-completed
+      filter_subject: events.metrica.cleanup.completed
+      mode: pull
+      deliver_policy: all
+      ack_policy: explicit
+      ack_wait_seconds: 30
+      max_deliver: -1
+    subscribe:
+      operationId: subscribeCleanupCompleted
+      description: ACK только после commit inbox+correlation; invalid schema/tenant/hash
+        → TERM; transient failure → NAK 1..60s. Handler не удаляет страницы. Runtime
+        consumer будет подключён отдельно; readiness требует live subscription.
+      message:
+        $ref: '#/components/messages/CleanupCompleted'
+  events.metrica.pages.merge.completed:
+    x-stream: METRICA_MAINTENANCE_RESULTS
+    x-owner: ya-metrica-service
+    x-consumers:
+    - service: seo-service
+      durable: seo-metrica-pages-merge-completed
+      filter_subject: events.metrica.pages.merge.completed
+      mode: pull
+      deliver_policy: all
+      ack_policy: explicit
+      ack_wait_seconds: 30
+      max_deliver: -1
+    subscribe:
+      operationId: subscribeMergeCompleted
+      description: ACK только после commit inbox+correlation; invalid schema/tenant/hash
+        → TERM; transient failure → NAK 1..60s. Handler не удаляет страницы. Runtime
+        consumer будет подключён отдельно; readiness требует live subscription.
+      message:
+        $ref: '#/components/messages/MergeCompleted'
 components:
   messages:
     ParseCommand:
@@ -43,6 +141,34 @@ components:
         $ref: '#/components/schemas/IdempotencyHeaders'
       payload:
         $ref: '#/components/schemas/ParseCommandPayload'
+    MergeCommand:
+      name: MergeCommand
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/MergeCommand'
+    MergeFinalized:
+      name: MergeFinalized
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/MergeFinalized'
+    CleanupCompleted:
+      name: CleanupCompleted
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/CleanupCompleted'
+    MergeCompleted:
+      name: MergeCompleted
+      contentType: application/json
+      headers:
+        $ref: '#/components/schemas/MaintenanceHeaders'
+      payload:
+        $ref: '#/components/schemas/MergeCompleted'
   schemas:
     IdempotencyHeaders:
       type: object
@@ -91,3 +217,316 @@ components:
         mode: {type: string, enum: [explicit]}
         date_from: {type: string, format: date}
         date_to: {type: string, format: date}
+    CleanupCompleted:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        cleanup_seq:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Cleanup Seq
+          type: integer
+        status:
+          const: completed
+          title: Status
+          type: string
+      required:
+      - schema_version
+      - message_id
+      - operation_id
+      - equestrian_id
+      - occurred_at
+      - cleanup_seq
+      - status
+      title: CleanupCompleted
+      type: object
+    PageMapping:
+      additionalProperties: false
+      properties:
+        source_page_id:
+          format: uuid
+          title: Source Page Id
+          type: string
+        target_page_id:
+          format: uuid
+          title: Target Page Id
+          type: string
+      required:
+      - source_page_id
+      - target_page_id
+      title: PageMapping
+      type: object
+      description: Source != target; source unique within part and across revision (producer
+        membership/tenant verification required).
+    MergeMappings:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        kind:
+          const: mappings
+          title: Kind
+          type: string
+        part_index:
+          maximum: 9223372036854775807
+          minimum: 0
+          title: Part Index
+          type: integer
+        mappings:
+          items:
+            $ref: '#/components/schemas/PageMapping'
+          maxItems: 500
+          minItems: 1
+          title: Mappings
+          type: array
+      required:
+      - schema_version
+      - message_id
+      - operation_id
+      - equestrian_id
+      - occurred_at
+      - normalization_revision
+      - kind
+      - part_index
+      - mappings
+      title: MergeMappings
+      type: object
+    MergeSeal:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        kind:
+          const: seal
+          title: Kind
+          type: string
+        part_count:
+          maximum: 9223372036854775807
+          minimum: 0
+          title: Part Count
+          type: integer
+      required:
+      - schema_version
+      - message_id
+      - operation_id
+      - equestrian_id
+      - occurred_at
+      - normalization_revision
+      - kind
+      - part_count
+      title: MergeSeal
+      type: object
+    MergeFinalized:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        result_message_id:
+          format: uuid
+          title: Result Message Id
+          type: string
+      required:
+      - schema_version
+      - message_id
+      - operation_id
+      - equestrian_id
+      - occurred_at
+      - normalization_revision
+      - result_message_id
+      title: MergeFinalized
+      type: object
+    MergeCompleted:
+      additionalProperties: false
+      properties:
+        schema_version:
+          const: 1
+          title: Schema Version
+          type: integer
+        message_id:
+          format: uuid
+          title: Message Id
+          type: string
+        operation_id:
+          format: uuid
+          title: Operation Id
+          type: string
+        equestrian_id:
+          format: uuid
+          title: Equestrian Id
+          type: string
+        occurred_at:
+          format: date-time
+          title: Occurred At
+          type: string
+        normalization_revision:
+          exclusiveMinimum: 0
+          maximum: 9223372036854775807
+          title: Normalization Revision
+          type: integer
+        status:
+          enum:
+          - completed
+          - superseded_by_delete
+          title: Status
+          type: string
+        part_count:
+          anyOf:
+          - maximum: 9223372036854775807
+            minimum: 0
+            type: integer
+          - type: 'null'
+          title: Part Count
+        cleanup_operation_id:
+          anyOf:
+          - format: uuid
+            type: string
+          - type: 'null'
+          default: null
+          title: Cleanup Operation Id
+        cleanup_seq:
+          anyOf:
+          - exclusiveMinimum: 0
+            maximum: 9223372036854775807
+            type: integer
+          - type: 'null'
+          default: null
+          title: Cleanup Seq
+      required:
+      - schema_version
+      - message_id
+      - operation_id
+      - equestrian_id
+      - occurred_at
+      - normalization_revision
+      - status
+      - part_count
+      title: MergeCompleted
+      type: object
+      description: completed requires non-null part_count and no cleanup correlation.
+        superseded_by_delete requires cleanup_operation_id and cleanup_seq; part_count
+        may be null until seal. SEO waits for cleanup completion before deleting sources.
+      oneOf:
+      - properties:
+          status:
+            const: completed
+          part_count:
+            type: integer
+            minimum: 0
+          cleanup_operation_id:
+            type: 'null'
+          cleanup_seq:
+            type: 'null'
+      - required:
+        - cleanup_operation_id
+        - cleanup_seq
+        properties:
+          status:
+            const: superseded_by_delete
+          cleanup_operation_id:
+            type: string
+            format: uuid
+          cleanup_seq:
+            type: integer
+            minimum: 1
+            maximum: 9223372036854775807
+    MergeCommand:
+      oneOf:
+      - $ref: '#/components/schemas/MergeMappings'
+      - $ref: '#/components/schemas/MergeSeal'
+    MaintenanceHeaders:
+      type: object
+      required:
+      - Nats-Msg-Id
+      properties:
+        Nats-Msg-Id:
+          type: string
+          format: uuid
+          description: Равен payload.message_id и детерминированному ID subject/operation/kind.

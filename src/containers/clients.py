@@ -1,6 +1,7 @@
 from dependency_injector import containers, providers
 
 from clients.nats import NatsJetstreamClient, ParseCommandPublisher
+from clients.nats.publisher import MaintenancePublisher
 from clients.ya_metrica import YaMetricaClient
 from clients.yandex_service import YandexServiceClient
 from containers.settings import SettingsContainer
@@ -21,6 +22,7 @@ class ClientsContainer(containers.DeclarativeContainer):
     settings_container = providers.Container(SettingsContainer)
 
     nats_client = providers.Singleton(NatsJetstreamClient, settings=settings_container.nats_settings)
+    maintenance_publisher = providers.Factory(MaintenancePublisher, client=nats_client)
     parse_command_publisher = providers.Factory(ParseCommandPublisher, client=nats_client)
 
     ya_metrica_client = providers.Factory(

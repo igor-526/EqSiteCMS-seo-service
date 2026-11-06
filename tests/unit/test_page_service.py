@@ -14,7 +14,13 @@ async def test_resolve_loads_both_tenant_blacklists_once_and_preserves_order() -
     params.get_values.return_value = frozenset({"utm_source"})
     hashes.get_values.return_value = frozenset({"top"})
     pages.resolve.return_value = {"/a": first_id, "/b#keep": second_id}
-    service = PageService(pages, PageNormalizer(), params, hashes)
+    service = PageService(
+        pages,
+        PageNormalizer(),
+        params,
+        hashes,
+        normalization_service=AsyncMock(canonical_ids=AsyncMock(side_effect=lambda **kwargs: kwargs["ids"])),
+    )
     data = SeoResolveInDto(items=["https://site.ru/a?utm_source=ya#top", "/b#keep", "/a"])
     result = await service.resolve(equestrian_id=tenant, data=data)
     params.get_values.assert_awaited_once_with(equestrian_id=tenant)
@@ -29,9 +35,13 @@ async def test_invalid_middle_page_never_writes() -> None:
     pages, params, hashes = AsyncMock(), AsyncMock(), AsyncMock()
     params.get_values.return_value = hashes.get_values.return_value = frozenset()
     with pytest.raises(ClientError) as error:
-        await PageService(pages, PageNormalizer(), params, hashes).resolve(
-            equestrian_id=uuid4(), data=SeoResolveInDto(items=["/a", "ftp://private.invalid/secret", "/b"])
-        )
+        await PageService(
+            pages,
+            PageNormalizer(),
+            params,
+            hashes,
+            normalization_service=AsyncMock(canonical_ids=AsyncMock(side_effect=lambda **kwargs: kwargs["ids"])),
+        ).resolve(equestrian_id=uuid4(), data=SeoResolveInDto(items=["/a", "ftp://private.invalid/secret", "/b"]))
     assert str(error.value) == "Некорректное значение элемента items[1]"
     pages.resolve.assert_not_awaited()
 
@@ -41,7 +51,13 @@ async def test_blacklists_are_reloaded_for_each_tenant_batch() -> None:
     params.get_values.side_effect = [frozenset({"track"}), frozenset()]
     hashes.get_values.return_value = frozenset()
     pages.resolve.return_value = {"/a": uuid4(), "/a?track=x": uuid4()}
-    service = PageService(pages, PageNormalizer(), params, hashes)
+    service = PageService(
+        pages,
+        PageNormalizer(),
+        params,
+        hashes,
+        normalization_service=AsyncMock(canonical_ids=AsyncMock(side_effect=lambda **kwargs: kwargs["ids"])),
+    )
     first_tenant, second_tenant = uuid4(), uuid4()
     data = SeoResolveInDto(items=["/a?track=x"])
     first = await service.resolve(equestrian_id=first_tenant, data=data)
@@ -58,9 +74,13 @@ async def test_max_page_batch() -> None:
     params.get_values.return_value = hashes.get_values.return_value = frozenset()
     values = [f"/page/{index}" for index in range(1000)]
     pages.resolve.return_value = {value: uuid4() for value in values}
-    result = await PageService(pages, PageNormalizer(), params, hashes).resolve(
-        equestrian_id=uuid4(), data=SeoResolveInDto(items=values)
-    )
+    result = await PageService(
+        pages,
+        PageNormalizer(),
+        params,
+        hashes,
+        normalization_service=AsyncMock(canonical_ids=AsyncMock(side_effect=lambda **kwargs: kwargs["ids"])),
+    ).resolve(equestrian_id=uuid4(), data=SeoResolveInDto(items=values))
     assert len(result.items) == 1000
     assert params.get_values.await_count == hashes.get_values.await_count == 1
 
@@ -83,6 +103,7 @@ def make_listing_service(repository=None, client=None):
             PageNormalizer(),
             AsyncMock(),
             AsyncMock(),
+            normalization_service=AsyncMock(canonical_ids=AsyncMock(side_effect=lambda **kwargs: kwargs["ids"])),
             ya_metrica_client=client,
             metrics_period_resolver=resolver,
             metrics_table_builder=services_container.metrics_table_builder(),

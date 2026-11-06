@@ -9,6 +9,7 @@ import pytest
 from clients.yandex_service import YandexServiceClient
 from core.exceptions import ParseTargetsUnavailableError
 from core.protocols.clients.yandex_service import YandexServiceClientProtocol
+from tests.yandex_contract import connected_counter_payload
 
 TENANT = uuid4()
 ITEM = {"equestrian_id": str(TENANT), "counter_id": "123"}
@@ -38,7 +39,13 @@ async def test_contract_without_credentials_or_cookie(caplog, monkeypatch, tmp_p
         assert request.extensions["timeout"] == dict.fromkeys(["connect", "read", "write", "pool"], 1.5)
         if request.url.path.endswith(str(TENANT)):
             assert not request.url.query
-            return httpx.Response(200, json={"counter": {**ITEM, "yandex_account": {"secret": "secret-body"}}})
+            return httpx.Response(
+                200,
+                json={
+                    **connected_counter_payload(tenant=TENANT),
+                    "counter": {**ITEM, "yandex_account": {"secret": "secret-body"}},
+                },
+            )
         assert dict(request.url.params) == {"limit": "100", "offset": "0"}
         return httpx.Response(200, json={"total": 1, "items": [ITEM]}, headers={"Set-Cookie": "secret-cookie=1"})
 
@@ -124,7 +131,10 @@ async def test_failures_are_safe(failure: str, method: str, caplog) -> None:
 async def test_absent_binding_and_out_of_range_page() -> None:
     def handler(request: httpx.Request) -> httpx.Response:
         return httpx.Response(
-            200, json={"counter": None} if request.url.path.endswith(str(TENANT)) else {"total": 0, "items": []}
+            200,
+            json=connected_counter_payload(tenant=TENANT, present=False)
+            if request.url.path.endswith(str(TENANT))
+            else {"total": 0, "items": []},
         )
 
     client = YandexServiceClient(base_url="http://peer", transport=httpx.MockTransport(handler))
@@ -136,7 +146,7 @@ async def test_wrong_binding_is_not_accepted() -> None:
     client = YandexServiceClient(
         base_url="http://peer",
         transport=httpx.MockTransport(
-            lambda request: httpx.Response(200, json={"counter": {**ITEM, "equestrian_id": str(uuid4())}})
+            lambda request: httpx.Response(200, json=connected_counter_payload(tenant=uuid4()))
         ),
     )
     with pytest.raises(ParseTargetsUnavailableError):

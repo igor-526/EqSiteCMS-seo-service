@@ -18,6 +18,7 @@ from core.services.metrics_period import MetricsPeriodResolver
 from core.services.metrics_table.builder import MetricsTableBuilder
 from core.services.metrics_table.registry import MetricRegistry
 
+from .normalization_service import NormalizationService
 from .page_normalizer import PageNormalizer
 
 
@@ -29,10 +30,12 @@ class PageService:
         blacklisted_query_param_repository: BlacklistedQueryParamRepositoryProtocol,
         blacklisted_hash_repository: BlacklistedHashRepositoryProtocol,
         *,
+        normalization_service: NormalizationService,
         ya_metrica_client: YaMetricaClientProtocol | None = None,
         metrics_period_resolver: MetricsPeriodResolver | None = None,
         metrics_table_builder: MetricsTableBuilder | None = None,
     ) -> None:
+        self._normalization = normalization_service
         self._ya_metrica_client = ya_metrica_client
         self._metrics_period_resolver = metrics_period_resolver
         self._metrics_table_builder = metrics_table_builder
@@ -42,6 +45,7 @@ class PageService:
         self._blacklisted_hash_repository = blacklisted_hash_repository
 
     async def resolve(self, *, equestrian_id: UUID, data: SeoResolveInDto) -> SeoResolveOutDto:
+        await self._normalization.lock(equestrian_id=equestrian_id)
         params = await self._blacklisted_query_param_repository.get_values(equestrian_id=equestrian_id)
         hashes = await self._blacklisted_hash_repository.get_values(equestrian_id=equestrian_id)
         normalized = []
@@ -53,6 +57,7 @@ class PageService:
             except InvalidValueError as exc:
                 raise exc.at_index(index) from None
         ids = await self._page_repository.resolve(equestrian_id=equestrian_id, values=list(dict.fromkeys(normalized)))
+        ids = await self._normalization.canonical_ids(equestrian_id=equestrian_id, ids=ids)
         return SeoResolveOutDto(
             items=[
                 SeoResolveItemOutDto(source=source, normalized=value, id=ids[value])
