@@ -1,0 +1,6 @@
+apiVersion: v2
+name: eqcms-seo-service
+description: Helm chart for EqSiteCMS SEO Service
+type: application
+version: 0.1.0
+appVersion: "1.0.0"
